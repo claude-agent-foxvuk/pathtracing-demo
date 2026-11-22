@@ -1,0 +1,1249 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>3D Path Tracing Showcase (4 Rooms + Water Pool + Culling)</title>
+<style>
+  body { margin: 0; background: #0a0a0a; color: #eee; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; user-select: none; }
+  canvas { width: 920px; height: 575px; border: 1px solid #333; box-shadow: 0 0 40px rgba(0,0,0,0.95); cursor: crosshair; }
+  .hud { margin-top: 10px; display: flex; gap: 11px; align-items: center; background: #161616; padding: 7px 14px; border-radius: 8px; border: 1px solid #2e2e2e; font-size: 13px; font-family: monospace; flex-wrap: wrap; justify-content: center; }
+  .gpu { color: #76b900; font-weight: bold; }
+  .cull { color: #38bdf8; font-weight: bold; }
+  .flash { color: #facc15; font-weight: bold; }
+  .author { color: #c084fc; font-weight: bold; }
+  .controls { margin-top: 8px; background: #131313; border: 1px solid #262626; padding: 7px 14px; border-radius: 8px; font-size: 12px; color: #bbb; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  .controls b { color: #fff; background: #252525; padding: 2px 6px; border-radius: 4px; border: 1px solid #383838; }
+</style>
+</head>
+<body>
+<div id="loadOverlay" style="position:fixed; left:0; top:0; right:0; bottom:0; background:#0a0a0a; display:flex; align-items:center; justify-content:center; z-index:10; font-size:18px; color:#38bdf8; font-family:monospace; letter-spacing:1px;">Компиляция шейдеров, подожди...</div>
+<canvas id="c" width="960" height="600"></canvas>
+<div class="hud">
+  <span id="fps">FPS: 0 | Сэмплов: 0</span>
+  <span>|</span>
+  <span class="cull" id="waterInfo">Вода: СКРЫТА</span>
+  <span>|</span>
+  <span class="flash" id="flashInfo">Фонарик [F]: ВЫКЛ</span>
+  <span>|</span>
+  <span class="gpu" id="gpuInfo">GPU: Определение...</span>
+  <span>|</span>
+  <span class="author">Сделано Claude Opus 5.5</span>
+</div>
+<div class="controls">
+  <span><b>Клик</b> — мышь</span>
+  <span><b>W A S D</b> — ходить</span>
+  <span><b>Space</b> — прыжок</span>
+  <span><b>F</b> — фонарик</span>
+  <span><b>ЛКМ</b> — взять/кинуть шар или лампу</span>
+  <span><b>E</b> — положить</span>
+  <span><b>R</b> — сброс объектов</span>
+  <span><b>ESC</b> — выход</span>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const loadOverlay = document.getElementById('loadOverlay');
+let gl = canvas.getContext('webgl2', { powerPreference: 'high-performance', antialias: false });
+if (!gl) gl = canvas.getContext('webgl2');
+if (!gl) {
+    loadOverlay.style.whiteSpace = 'pre-line';
+    loadOverlay.style.textAlign = 'center';
+    loadOverlay.style.padding = '0 24px';
+    loadOverlay.style.color = '#ff5555';
+    loadOverlay.textContent = 'WebGL2 не запустился в этом браузере.\n\nПолностью закрой ВСЕ окна браузера и открой файл заново — после прошлых фризов браузер отключает GPU-ускорение до перезапуска.\n\nЕсли снова не работает — перезагрузи ПК или обнови драйвер видеокарты.';
+    throw new Error('WebGL2 context unavailable');
+}
+const fpsEl = document.getElementById('fps');
+const waterEl = document.getElementById('waterInfo');
+const flashEl = document.getElementById('flashInfo');
+const gpuEl = document.getElementById('gpuInfo');
+
+const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+if (dbg) {
+    let renderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+    renderer = renderer.replace(/ANGLE \(|, Direct3D.*|\)/g, '');
+    gpuEl.textContent = `GPU: ${renderer}`;
+} else {
+    gpuEl.textContent = `GPU: ${gl.getParameter(gl.RENDERER)}`;
+}
+
+const vs = `#version 300 es
+in vec2 p;
+void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
+
+const fs = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+uniform vec2 res;
+uniform float frame;
+uniform float timeSec;
+uniform float blendWeight;
+uniform float walkPhase;
+uniform int spp;
+uniform int maxBounces;
+uniform int flashlight;
+uniform int waterActive;
+uniform vec3 camPos;
+uniform mat3 camRot;
+uniform vec4 s0;
+uniform vec4 s1;
+uniform vec4 s2;
+uniform vec4 s3;
+uniform vec4 s4;
+uniform sampler2D prevFrame;
+
+float ign(vec2 p, float f) {
+    p += f * vec2(5.588238, 5.588238);
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+vec3 sampleDisk(vec2 u) {
+    float r = sqrt(u.x);
+    float a = 6.2831853 * u.y;
+    return vec3(r * cos(a), 0.0, r * sin(a));
+}
+
+struct Hit { float t; vec3 n; vec3 col; vec3 emit; int mat; float rough; };
+
+Hit intersectSphere(vec3 ro, vec3 rd, vec3 c, float r, vec3 col, vec3 emit, int mat, float rough) {
+    if (r < 0.0) return Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    vec3 oc = ro - c;
+    float b = dot(oc, rd);
+    float h = b * b - (dot(oc, oc) - r * r);
+    if (h < 0.0) return Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    float s = sqrt(h);
+    float t = -b - s;
+    if (t < 0.001) t = -b + s;
+    if (t < 0.001) return Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    return Hit(t, (ro + rd * t - c) / r, col, emit, mat, rough);
+}
+
+Hit intersectCapsule(vec3 ro, vec3 rd, vec3 pa, vec3 pb, float r, vec3 col, vec3 emit, int mat, float rough) {
+    vec3 ba = pb - pa;
+    vec3 oa = ro - pa;
+    float baba = dot(ba, ba);
+    float bard = dot(ba, rd);
+    float baoa = dot(ba, oa);
+    float rdoa = dot(rd, oa);
+    float oaoa = dot(oa, oa);
+    float a = baba - bard * bard;
+    float b = baba * rdoa - baoa * bard;
+    float c = baba * oaoa - baoa * baoa - r * r * baba;
+    float h = b * b - a * c;
+    if (h >= 0.0) {
+        float t = (-b - sqrt(h)) / a;
+        float y = baoa + t * bard;
+        if (y > 0.0 && y < baba && t > 0.001) {
+            vec3 n = (oa + t * rd - ba * y / baba) / r;
+            return Hit(t, n, col, emit, mat, rough);
+        }
+        vec3 oc = (y <= 0.0) ? oa : ro - pb;
+        b = dot(rd, oc);
+        c = dot(oc, oc) - r * r;
+        h = b * b - c;
+        if (h > 0.0) {
+            t = -b - sqrt(h);
+            if (t > 0.001) {
+                vec3 n = (oc + t * rd) / r;
+                return Hit(t, n, col, emit, mat, rough);
+            }
+        }
+    }
+    return Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+}
+
+Hit intersectCylinder(vec3 ro, vec3 rd, vec2 c, float r, float yMin, float yMax, vec3 col, int mat) {
+    vec2 oc = ro.xz - c;
+    float a = dot(rd.xz, rd.xz);
+    if (a < 0.00001) return Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    float b = dot(oc, rd.xz);
+    float h = b * b - a * (dot(oc, oc) - r * r);
+    if (h < 0.0) return Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    float s = sqrt(h);
+    float t = (-b - s) / a;
+    if (t < 0.001) t = (-b + s) / a;
+    if (t < 0.001) return Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    float y = ro.y + rd.y * t;
+    if (y < yMin || y > yMax) return Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    vec2 hitXZ = ro.xz + rd.xz * t;
+    vec3 n = vec3((hitXZ.x - c.x) / r, 0.0, (hitXZ.y - c.y) / r);
+    return Hit(t, n, col, vec3(0.0), mat, 0.02);
+}
+
+bool inMap(vec3 p) {
+    if (p.y < -1.005 || p.y > 3.205) return false;
+    if (abs(p.x) <= 6.005 && abs(p.z) <= 8.005) return true;
+    if (abs(p.x) <= 10.005 && p.z >= -6.805 && p.z <= -3.195 && p.y <= 2.405) return true;
+    if (abs(p.x) >= 9.995 && abs(p.x) <= 20.005 && abs(p.z) <= 8.005) return true;
+    if (p.x >= -22.005 && p.x <= -19.995 && abs(p.z) <= 2.005 && p.y <= 2.405) return true;
+    if (p.x >= -34.005 && p.x <= -21.995 && abs(p.z) <= 8.005) return true;
+    return false;
+}
+
+bool inPoolBasin(vec3 p) {
+    return (p.x >= -32.0 && p.x <= -24.0 && abs(p.z) <= 5.5);
+}
+
+vec3 getWaterNormal(vec2 p, float t) {
+    float w1 = sin(p.x * 2.8 + t * 2.4) * cos(p.y * 2.5 - t * 1.9);
+    float w2 = sin((p.x + p.y) * 4.5 - t * 3.1) * 0.5;
+    float w3 = cos((p.x - p.y * 1.3) * 7.2 + t * 4.0) * 0.25;
+    float dx = cos(p.x * 2.8 + t * 2.4) * 2.8 * cos(p.y * 2.5 - t * 1.9)
+             + cos((p.x + p.y) * 4.5 - t * 3.1) * 2.25
+             - sin((p.x - p.y * 1.3) * 7.2 + t * 4.0) * 1.8;
+    float dz = -sin(p.x * 2.8 + t * 2.4) * sin(p.y * 2.5 - t * 1.9) * 2.5
+             + cos((p.x + p.y) * 4.5 - t * 3.1) * 2.25
+             + sin((p.x - p.y * 1.3) * 7.2 + t * 4.0) * 2.34;
+    return normalize(vec3(-dx * 0.022, 1.0, -dz * 0.022));
+}
+
+float getWaterCaustic(vec2 p, float t) {
+    float c1 = sin(p.x * 3.2 + t * 2.2) + cos(p.y * 3.4 - t * 2.0);
+    float c2 = sin((p.x - p.y) * 5.0 + t * 3.3);
+    float v = 1.0 - abs(c1 * 0.5 + c2 * 0.35);
+    return pow(clamp(v, 0.0, 1.0), 4.0);
+}
+
+vec3 blendFloorColor(float x, float checker) {
+    vec3 mainFloor = mix(vec3(0.75, 0.76, 0.79), vec3(0.40, 0.42, 0.46), checker);
+    vec3 neonFloor = mix(vec3(0.24, 0.26, 0.32), vec3(0.11, 0.13, 0.17), checker);
+    vec3 darkFloor = mix(vec3(0.50, 0.52, 0.56), vec3(0.26, 0.28, 0.32), checker);
+    vec3 poolEdge  = mix(vec3(0.32, 0.38, 0.42), vec3(0.22, 0.27, 0.30), checker);
+    float tNeon = smoothstep(6.0, 10.0, x);
+    float tDark = smoothstep(-6.0, -10.0, x);
+    float tPool = smoothstep(-20.0, -22.5, x);
+    vec3 col = mix(mainFloor, neonFloor, tNeon);
+    col = mix(col, darkFloor, tDark);
+    col = mix(col, poolEdge, tPool);
+    return col;
+}
+
+vec3 blendCeilingColor(float x) {
+    float tNeon = smoothstep(6.0, 10.0, x);
+    float tDark = smoothstep(-6.0, -10.0, x);
+    float tPool = smoothstep(-20.0, -22.5, x);
+    vec3 col = mix(vec3(0.85), vec3(0.22, 0.24, 0.30), tNeon);
+    col = mix(col, vec3(0.55), tDark);
+    col = mix(col, vec3(0.25, 0.34, 0.38), tPool);
+    return col;
+}
+
+Hit traceCharacter(vec3 ro, vec3 rd, Hit best) {
+    vec3 fwd = camRot * vec3(0.0, 0.0, -1.0);
+    vec3 flatFwd = vec3(fwd.x, 0.0, fwd.z);
+    vec3 lookDir = length(flatFwd) > 0.001 ? normalize(flatFwd) : vec3(0.0, 0.0, -1.0);
+    vec3 rightDir = normalize(cross(lookDir, vec3(0.0, 1.0, 0.0)));
+    float pitchTilt = clamp(fwd.y, -0.6, 0.6);
+
+    Hit h;
+    vec3 headPos = camPos + vec3(0.0, 0.02, 0.0);
+    h = intersectSphere(ro, rd, headPos, 0.165, vec3(0.22, 0.24, 0.28), vec3(0.0), 0, 0.25); if (h.t < best.t) best = h;
+    vec3 visorPos = headPos + lookDir * 0.075 + vec3(0.0, pitchTilt * 0.06, 0.0);
+    h = intersectSphere(ro, rd, visorPos, 0.135, vec3(0.95, 0.65, 0.15), vec3(0.15, 0.35, 0.65), 1, 0.05); if (h.t < best.t) best = h;
+
+    vec3 chestTop = camPos + vec3(0.0, -0.22, 0.0);
+    vec3 chestBot = camPos + vec3(0.0, -0.52, 0.0);
+    h = intersectCapsule(ro, rd, chestBot, chestTop, 0.18, vec3(0.18, 0.20, 0.25), vec3(0.0), 0, 0.35); if (h.t < best.t) best = h;
+    vec3 corePos = camPos + vec3(0.0, -0.32, 0.0) + lookDir * 0.165;
+    h = intersectSphere(ro, rd, corePos, 0.055, vec3(1.0), vec3(0.6, 2.2, 4.5), 0, 0.1); if (h.t < best.t) best = h;
+
+    vec3 shoulderR = camPos + vec3(0.0, -0.20, 0.0) + rightDir * 0.22;
+    vec3 lampEmit = flashlight == 1 ? vec3(8.0, 8.2, 9.0) : vec3(0.0);
+    h = intersectSphere(ro, rd, shoulderR + lookDir * 0.08, 0.045, vec3(0.9), lampEmit, 0, 0.1); if (h.t < best.t) best = h;
+
+    float swing = sin(walkPhase) * 0.18;
+    vec3 lShoulder = camPos + vec3(0.0, -0.22, 0.0) - rightDir * 0.23;
+    vec3 lHand = camPos + vec3(0.0, -0.56, 0.0) - rightDir * 0.25 - lookDir * swing;
+    h = intersectCapsule(ro, rd, lHand, lShoulder, 0.062, vec3(0.25, 0.28, 0.34), vec3(0.0), 0, 0.4); if (h.t < best.t) best = h;
+
+    vec3 rHand = camPos + vec3(0.0, -0.56, 0.0) + rightDir * 0.25 + lookDir * swing;
+    h = intersectCapsule(ro, rd, rHand, shoulderR, 0.062, vec3(0.25, 0.28, 0.34), vec3(0.0), 0, 0.4); if (h.t < best.t) best = h;
+
+    vec3 lHip = camPos + vec3(0.0, -0.55, 0.0) - rightDir * 0.10;
+    vec3 lFoot = camPos + vec3(0.0, -0.93, 0.0) - rightDir * 0.11 + lookDir * (swing * 1.25);
+    h = intersectCapsule(ro, rd, lFoot, lHip, 0.075, vec3(0.14, 0.16, 0.22), vec3(0.0), 0, 0.45); if (h.t < best.t) best = h;
+
+    vec3 rHip = camPos + vec3(0.0, -0.55, 0.0) + rightDir * 0.10;
+    vec3 rFoot = camPos + vec3(0.0, -0.93, 0.0) + rightDir * 0.11 - lookDir * (swing * 1.25);
+    h = intersectCapsule(ro, rd, rFoot, rHip, 0.075, vec3(0.14, 0.16, 0.22), vec3(0.0), 0, 0.45); if (h.t < best.t) best = h;
+
+    return best;
+}
+
+Hit traceScene(vec3 ro, vec3 rd, bool isPrimary) {
+    Hit best = Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    Hit h;
+    float t;
+
+    if (abs(rd.y) > 0.00001) {
+        t = (-1.0 - ro.y) / rd.y;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (inMap(p)) {
+                if (inPoolBasin(p)) {
+                    if (waterActive == 1) {
+                        vec3 wn = getWaterNormal(p.xz, timeSec);
+                        best = Hit(t, wn, vec3(0.12, 0.72, 0.82), vec3(0.0), 4, 0.02);
+                    } else {
+                        best = Hit(t, vec3(0.0, 1.0, 0.0), vec3(0.06, 0.28, 0.34), vec3(0.0), 0, 0.1);
+                    }
+                } else {
+                    float checker = mod(floor(p.x * 1.0) + floor(p.z * 1.0), 2.0);
+                    best = Hit(t, vec3(0.0, 1.0, 0.0), blendFloorColor(p.x, checker), vec3(0.0), 0, 0.22);
+                }
+            }
+        }
+        t = (3.2 - ro.y) / rd.y;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (inMap(p)) best = Hit(t, vec3(0.0, -1.0, 0.0), blendCeilingColor(p.x), vec3(0.0), 0, 0.75);
+        }
+        t = (2.4 - ro.y) / rd.y;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            bool inCor1 = (abs(p.x) >= 6.0 && abs(p.x) <= 10.0 && p.z >= -6.8 && p.z <= -3.2);
+            bool inCor2 = (p.x >= -22.0 && p.x <= -20.0 && abs(p.z) <= 2.0);
+            if (inCor1 || inCor2) {
+                best = Hit(t, vec3(0.0, -1.0, 0.0), blendCeilingColor(p.x), vec3(0.0), 0, 0.65);
+            }
+        }
+    }
+
+    if (abs(rd.z) > 0.00001) {
+        t = (-8.0 - ro.z) / rd.z;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (inMap(p)) {
+                if (abs(p.x) <= 6.0) {
+                    bool isFrame = abs(p.x) > 5.82 || p.y < -0.90 || p.y > 3.05;
+                    if (isFrame) {
+                        best = Hit(t, vec3(0.0, 0.0, 1.0), vec3(0.14, 0.14, 0.17), vec3(0.0), 0, 0.35);
+                    } else {
+                        best = Hit(t, vec3(0.0, 0.0, 1.0), vec3(0.96, 0.98, 0.99), vec3(0.0), 1, 0.01);
+                    }
+                } else {
+                    vec3 wCol = p.x > 10.0 ? vec3(0.25, 0.25, 0.32) : (p.x < -21.0 ? vec3(0.24, 0.36, 0.42) : vec3(0.65));
+                    best = Hit(t, vec3(0.0, 0.0, 1.0), wCol, vec3(0.0), 0, 0.45);
+                }
+            }
+        }
+        t = (8.0 - ro.z) / rd.z;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (inMap(p)) {
+                vec3 wCol = p.x > 10.0 ? vec3(0.25, 0.25, 0.32) : (p.x < -21.0 ? vec3(0.24, 0.36, 0.42) : vec3(0.80));
+                best = Hit(t, vec3(0.0, 0.0, -1.0), wCol, vec3(0.0), 0, 0.45);
+            }
+        }
+        t = (-6.8 - ro.z) / rd.z;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (abs(p.x) >= 6.0 && abs(p.x) <= 10.0 && p.y >= -1.0 && p.y <= 2.4) {
+                vec3 wallCol = p.x > 0.0 ? mix(vec3(0.22, 0.78, 0.52), vec3(0.18, 0.65, 0.85), (p.x - 6.0) / 4.0)
+                                         : mix(vec3(0.82, 0.22, 0.22), vec3(0.45, 0.45, 0.48), (-6.0 - p.x) / 4.0);
+                best = Hit(t, vec3(0.0, 0.0, 1.0), wallCol, vec3(0.0), 0, 0.45);
+            }
+        }
+        t = (-3.2 - ro.z) / rd.z;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (abs(p.x) >= 6.0 && abs(p.x) <= 10.0 && p.y >= -1.0 && p.y <= 2.4) {
+                vec3 wallCol = p.x > 0.0 ? mix(vec3(0.22, 0.78, 0.52), vec3(0.82, 0.22, 0.72), (p.x - 6.0) / 4.0)
+                                         : mix(vec3(0.82, 0.22, 0.22), vec3(0.45, 0.45, 0.48), (-6.0 - p.x) / 4.0);
+                best = Hit(t, vec3(0.0, 0.0, -1.0), wallCol, vec3(0.0), 0, 0.45);
+            }
+        }
+        t = (-2.0 - ro.z) / rd.z;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (p.x >= -22.0 && p.x <= -20.0 && p.y >= -1.0 && p.y <= 2.4) {
+                best = Hit(t, vec3(0.0, 0.0, 1.0), vec3(0.28, 0.36, 0.40), vec3(0.0), 0, 0.45);
+            }
+        }
+        t = (2.0 - ro.z) / rd.z;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (p.x >= -22.0 && p.x <= -20.0 && p.y >= -1.0 && p.y <= 2.4) {
+                best = Hit(t, vec3(0.0, 0.0, -1.0), vec3(0.28, 0.36, 0.40), vec3(0.0), 0, 0.45);
+            }
+        }
+    }
+
+    if (abs(rd.x) > 0.00001) {
+        vec4 xWalls = vec4(-6.0, 6.0, -10.0, 10.0);
+        for (int i = 0; i < 4; i++) {
+            float xw = xWalls[i];
+            t = (xw - ro.x) / rd.x;
+            if (t > 0.001 && t < best.t) {
+                vec3 p = ro + rd * t;
+                if (p.y >= -1.0 && p.y <= 3.2 && abs(p.z) <= 8.0) {
+                    bool inDoor = (p.z >= -6.8 && p.z <= -3.2 && p.y <= 2.4);
+                    if (!inDoor) {
+                        vec3 n = vec3(rd.x > 0.0 ? -1.0 : 1.0, 0.0, 0.0);
+                        vec3 col = vec3(0.75);
+                        if (xw == -6.0 && rd.x < 0.0) col = vec3(0.88, 0.18, 0.18);
+                        if (xw ==  6.0 && rd.x > 0.0) col = vec3(0.18, 0.82, 0.45);
+                        if (xw == 10.0 && rd.x < 0.0) col = vec3(0.25, 0.25, 0.35);
+                        if (xw == -10.0 && rd.x > 0.0) col = vec3(0.55);
+                        best = Hit(t, n, col, vec3(0.0), 0, 0.5);
+                    }
+                }
+            }
+        }
+        vec2 poolWalls = vec2(-20.0, -22.0);
+        for (int i = 0; i < 2; i++) {
+            float xw = poolWalls[i];
+            t = (xw - ro.x) / rd.x;
+            if (t > 0.001 && t < best.t) {
+                vec3 p = ro + rd * t;
+                if (p.y >= -1.0 && p.y <= 3.2 && abs(p.z) <= 8.0) {
+                    bool inDoor = (abs(p.z) <= 2.0 && p.y <= 2.4);
+                    if (!inDoor) {
+                        vec3 n = vec3(rd.x > 0.0 ? -1.0 : 1.0, 0.0, 0.0);
+                        vec3 col = (xw == -22.0 && rd.x < 0.0) ? vec3(0.24, 0.36, 0.42) : vec3(0.50);
+                        best = Hit(t, n, col, vec3(0.0), 0, 0.5);
+                    }
+                }
+            }
+        }
+        t = (-34.0 - ro.x) / rd.x;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (inMap(p)) best = Hit(t, vec3(1.0, 0.0, 0.0), vec3(0.24, 0.36, 0.42), vec3(0.0), 0, 0.45);
+        }
+        t = (20.0 - ro.x) / rd.x;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (inMap(p)) best = Hit(t, vec3(-1.0, 0.0, 0.0), vec3(0.25, 0.25, 0.35), vec3(0.0), 0, 0.45);
+        }
+    }
+
+    h = intersectSphere(ro, rd, vec3(0.0, 4.6, -1.5), 2.5, vec3(1.0), vec3(6.5, 6.2, 5.8), 3, 1.0); if (h.t < best.t) best = h;
+    h = intersectSphere(ro, rd, vec3(15.0, 2.6, -5.2), 0.55, vec3(1.0), vec3(0.2, 4.5, 6.5), 0, 1.0); if (h.t < best.t) best = h;
+    h = intersectSphere(ro, rd, vec3(15.0, 2.6,  5.2), 0.55, vec3(1.0), vec3(6.5, 0.4, 5.5), 0, 1.0); if (h.t < best.t) best = h;
+    h = intersectSphere(ro, rd, vec3(18.5, 1.8,  0.0), 0.50, vec3(1.0), vec3(6.5, 2.5, 0.3), 0, 1.0); if (h.t < best.t) best = h;
+    h = intersectSphere(ro, rd, vec3(-28.0, 3.05, 0.0), 0.45, vec3(1.0), vec3(0.45, 1.35, 1.65), 0, 1.0); if (h.t < best.t) best = h;
+
+    h = intersectCylinder(ro, rd, vec2(13.2, -2.2), 0.42, -1.0, 3.2, vec3(0.95, 0.97, 1.0), 1); if (h.t < best.t) best = h;
+    h = intersectCylinder(ro, rd, vec2(13.2,  2.5), 0.42, -1.0, 3.2, vec3(0.95, 0.97, 1.0), 1); if (h.t < best.t) best = h;
+
+    h = intersectSphere(ro, rd, s0.xyz, s0.w, vec3(0.98, 1.0, 0.99), vec3(0.0), 2, 0.02); if (h.t < best.t) best = h;
+    h = intersectSphere(ro, rd, s1.xyz, s1.w, vec3(0.96, 0.96, 0.98), vec3(0.0), 1, 0.01); if (h.t < best.t) best = h;
+    h = intersectSphere(ro, rd, s2.xyz, s2.w, vec3(0.2, 0.55, 0.98), vec3(0.0), 0, 0.18); if (h.t < best.t) best = h;
+    h = intersectSphere(ro, rd, s3.xyz, s3.w, vec3(1.0, 0.78, 0.25), vec3(0.0), 1, 0.02); if (h.t < best.t) best = h;
+    h = intersectSphere(ro, rd, s4.xyz, s4.w, vec3(1.0), vec3(7.5, 6.8, 5.2), 0, 1.0); if (h.t < best.t) best = h;
+
+    if (!isPrimary) {
+        best = traceCharacter(ro, rd, best);
+    }
+    return best;
+}
+
+float sphereAO(vec3 p, vec3 n, vec4 sph) {
+    if (sph.w < 0.0) return 1.0;
+    vec3 d = sph.xyz - p;
+    float dist = length(d);
+    if (dist <= sph.w) return 1.0;
+    float ao = max(0.0, dot(n, d / dist)) * pow(sph.w / dist, 2.0);
+    return 1.0 - clamp(ao * 1.15, 0.0, 0.78);
+}
+
+vec3 shadePBR(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough, vec3 lDir, vec3 lCol) {
+    float ndotl = max(dot(n, lDir), 0.0);
+    if (ndotl <= 0.0) return vec3(0.0);
+    vec3 H = normalize(lDir + V);
+    float ndoth = max(dot(n, H), 0.0);
+    float shininess = mix(128.0, 8.0, rough);
+    float spec = pow(ndoth, shininess) * mix(0.35, 0.03, rough);
+    return (baseCol * ndotl + vec3(spec)) * lCol;
+}
+
+vec3 evalMetalSphereBounce(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough, vec4 ms, vec3 tint) {
+    vec3 toM = ms.xyz - p;
+    float dM = length(toM);
+    if (dM <= ms.w || dM >= 4.5) return vec3(0.0);
+    vec3 dirM = toM / dM;
+    float ndl = max(dot(n, dirM), 0.0);
+    if (ndl <= 0.0) return vec3(0.0);
+
+    vec3 lightOnBall = vec3(0.0);
+    if (abs(ms.x) < 8.5) lightOnBall += vec3(0.45, 0.43, 0.40);
+    if (ms.x > 8.5) lightOnBall += vec3(0.45, 0.25, 0.55);
+    if (ms.x < -21.0) lightOnBall += vec3(0.10, 0.25, 0.30);
+    if (s4.w > 0.0) {
+        float dLamp = length(s4.xyz - ms.xyz);
+        lightOnBall += vec3(1.1, 0.98, 0.75) * (6.0 / max(dLamp * dLamp, 0.5));
+    }
+    if (flashlight == 1) {
+        vec3 spotDir = normalize(camRot * vec3(0.0, 0.0, -1.0));
+        vec3 toBall = ms.xyz - camPos;
+        float dF = length(toBall);
+        float cA = dot(toBall / dF, spotDir);
+        if (cA > 0.84) lightOnBall += vec3(1.1) * smoothstep(0.84, 0.96, cA) * (16.0 / max(dF * dF, 1.0));
+    }
+    float caustic = pow(ms.w / dM, 2.2) * 1.4;
+    return shadePBR(p, n, V, baseCol, rough, dirM, lightOnBall * tint * caustic);
+}
+
+vec3 evalReflectedLights(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough) {
+    vec3 bounceCol = vec3(0.0);
+
+    if (s4.w > 0.0 && p.x > -7.5 && p.x < 7.5 && p.z < 5.0) {
+        vec3 mirrorLightPos = vec3(s4.x, s4.y, -16.0 - s4.z);
+        vec3 toML = mirrorLightPos - p;
+        float distM = length(toML);
+        vec3 dirM = toML / distM;
+        if (dirM.z < -0.05) {
+            float tMirror = (-8.0 - p.z) / dirM.z;
+            vec3 hitMirror = p + dirM * tMirror;
+            if (abs(hitMirror.x) < 5.82 && hitMirror.y > -0.90 && hitMirror.y < 3.05) {
+                Hit sh1 = traceScene(p + n * 0.005, dirM, true);
+                if (abs(sh1.t - tMirror) < 0.08) {
+                    vec3 toRealLamp = s4.xyz - hitMirror;
+                    float dReal = length(toRealLamp);
+                    Hit sh2 = traceScene(hitMirror + vec3(0.0, 0.0, 0.005), toRealLamp / dReal, true);
+                    if (sh2.t >= dReal - s4.w - 0.06) {
+                        float atten = 9.0 / max(distM * distM, 1.5);
+                        bounceCol += shadePBR(p, n, V, baseCol, rough, dirM, vec3(1.1, 0.98, 0.75) * atten);
+                    }
+                }
+            }
+        }
+    }
+
+    if (flashlight == 1 && p.x > -7.5 && p.x < 7.5 && p.z < 6.0) {
+        vec3 spotDir = normalize(camRot * vec3(0.0, 0.0, -1.0));
+        vec3 mirrorCamPos = vec3(camPos.x, camPos.y, -16.0 - camPos.z);
+        vec3 mirrorSpotDir = vec3(spotDir.x, spotDir.y, -spotDir.z);
+        vec3 toSurf = p - mirrorCamPos;
+        float distF = length(toSurf);
+        vec3 dirToSurf = toSurf / distF;
+        float cosAng = dot(dirToSurf, mirrorSpotDir);
+        if (cosAng > 0.85 && dirToSurf.z > 0.05) {
+            float tMirror = (-8.0 - mirrorCamPos.z) / dirToSurf.z;
+            vec3 hitMirror = mirrorCamPos + dirToSurf * tMirror;
+            if (abs(hitMirror.x) < 5.82 && hitMirror.y > -0.90 && hitMirror.y < 3.05) {
+                Hit sh = traceScene(p + n * 0.005, -dirToSurf, true);
+                if (abs(sh.t - (distF - tMirror)) < 0.08) {
+                    float cone = smoothstep(0.85, 0.96, cosAng);
+                    float attenF = 20.0 / max(distF * distF, 2.0);
+                    bounceCol += shadePBR(p, n, V, baseCol, rough, -dirToSurf, vec3(1.05, 1.08, 1.15) * cone * attenF);
+                }
+            }
+        }
+    }
+
+    bounceCol += evalMetalSphereBounce(p, n, V, baseCol, rough, s1, vec3(0.95, 0.97, 1.0));
+    bounceCol += evalMetalSphereBounce(p, n, V, baseCol, rough, s3, vec3(1.0, 0.78, 0.25));
+
+    return bounceCol;
+}
+
+vec3 evalPointLight(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough, vec3 lPos, float lRad, vec3 lCol, float intensity, float ambientLeak) {
+    vec3 toL = lPos - p;
+    float dist = length(toL);
+    if (dist > 22.0) return vec3(0.0);
+    vec3 lDir = toL / dist;
+    float ndl = max(dot(n, lDir), 0.0);
+    float atten = intensity / max(dist * dist, 2.5);
+    float fade = 1.0 - smoothstep(14.0, 22.0, dist);
+    if (ndl <= 0.0) return baseCol * lCol * atten * ambientLeak * fade;
+
+    Hit sh = traceScene(p + n * 0.005, lDir, true);
+    float vis = (sh.t >= dist - lRad - 0.08) ? 1.0 : ambientLeak;
+    vec3 pbr = shadePBR(p, n, V, baseCol, rough, lDir, lCol * vis * atten * fade);
+    return pbr + baseCol * lCol * ambientLeak * atten * fade;
+}
+
+vec3 computeRoomGI(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough) {
+    vec3 gi = vec3(0.0);
+
+    float mainRoomFactor = 1.0 - smoothstep(5.5, 11.5, abs(p.x));
+    if (mainRoomFactor > 0.001) {
+        float redFactor = clamp(1.0 - (p.x + 6.0) / 10.5, 0.0, 1.0) * (0.65 + 0.35 * max(-n.x, 0.0));
+        float greenFactor = clamp(1.0 - (6.0 - p.x) / 10.5, 0.0, 1.0) * (0.65 + 0.35 * max(n.x, 0.0));
+        float skyFactor = 0.55 + 0.45 * n.y;
+        vec3 ambCol = vec3(0.32, 0.33, 0.36) * skyFactor + vec3(0.38, 0.07, 0.07) * redFactor + vec3(0.07, 0.35, 0.18) * greenFactor;
+        gi += baseCol * ambCol * mainRoomFactor;
+    }
+
+    if (p.x > 3.5) {
+        gi += evalPointLight(p, n, V, baseCol, rough, vec3(15.0, 2.6, -5.2), 0.55, vec3(0.05, 0.85, 1.0), 20.0, 0.12);
+        gi += evalPointLight(p, n, V, baseCol, rough, vec3(15.0, 2.6,  5.2), 0.55, vec3(1.0, 0.12, 0.85), 20.0, 0.12);
+        gi += evalPointLight(p, n, V, baseCol, rough, vec3(18.5, 1.8,  0.0), 0.50, vec3(1.0, 0.42, 0.05), 16.0, 0.08);
+    }
+
+    if (p.x < -18.5) {
+        gi += evalPointLight(p, n, V, baseCol, rough, vec3(-28.0, 3.05, 0.0), 0.45, vec3(0.16, 0.48, 0.58), 5.5, 0.18);
+        if (waterActive == 1 && p.y > -0.95) {
+            float poolGlow = clamp(1.0 - length(p.xz - vec2(-28.0, 0.0)) / 9.0, 0.0, 1.0);
+            float c = getWaterCaustic(p.xz + p.y * 0.4, timeSec);
+            gi += baseCol * vec3(0.06, 0.24, 0.30) * poolGlow * (0.4 + c * 0.7);
+        }
+    }
+
+    if (s4.w > 0.0) {
+        vec3 toPortable = s4.xyz - p;
+        float distP = length(toPortable);
+        if (distP < 16.0) {
+            vec3 lDirP = toPortable / distP;
+            float ndotlP = max(dot(n, lDirP), 0.0);
+            float attenP = 13.0 / max(distP * distP, 0.45);
+            float fadeP = 1.0 - smoothstep(10.0, 16.0, distP);
+            if (ndotlP > 0.0) {
+                Hit shP = traceScene(p + n * 0.005, lDirP, true);
+                float visP = (shP.t >= distP - s4.w - 0.06) ? 1.0 : 0.08;
+                gi += shadePBR(p, n, V, baseCol, rough, lDirP, vec3(1.15, 1.02, 0.78) * visP * attenP * fadeP);
+                gi += baseCol * vec3(1.15, 1.02, 0.78) * 0.06 * attenP * fadeP;
+            } else {
+                gi += baseCol * vec3(1.15, 1.02, 0.78) * 0.06 * attenP * fadeP;
+            }
+        }
+    }
+
+    if (flashlight == 1) {
+        vec3 spotDir = normalize(camRot * vec3(0.0, 0.0, -1.0));
+        vec3 toSurf = p - camPos;
+        float distF = length(toSurf);
+        if (distF < 20.0 && distF > 0.05) {
+            vec3 dirToSurf = toSurf / distF;
+            float cosAng = dot(dirToSurf, spotDir);
+            if (cosAng > 0.84) {
+                float ndotlF = max(dot(n, -dirToSurf), 0.0);
+                if (ndotlF > 0.0) {
+                    Hit shF = traceScene(p + n * 0.005, -dirToSurf, true);
+                    if (shF.t >= distF - 0.05) {
+                        float cone = smoothstep(0.84, 0.96, cosAng);
+                        float attenF = 24.0 / max(distF * distF, 1.2);
+                        gi += shadePBR(p, n, V, baseCol, rough, -dirToSurf, vec3(1.1, 1.12, 1.18) * cone * attenF);
+                    }
+                }
+            }
+        }
+    }
+
+    gi += evalReflectedLights(p, n, V, baseCol, rough);
+
+    float ao = 1.0;
+    ao *= sphereAO(p, n, s0);
+    ao *= sphereAO(p, n, s1);
+    ao *= sphereAO(p, n, s2);
+    ao *= sphereAO(p, n, s3);
+    ao *= sphereAO(p, n, vec4(camPos + vec3(0.0, -0.5, 0.0), 0.32));
+
+    return gi * ao;
+}
+
+vec3 computeDirectLight(vec3 hitPos, vec3 n, vec3 V, vec3 baseCol, float rough, vec2 u) {
+    if (abs(hitPos.x) > 13.0) return vec3(0.0);
+    vec3 lightCenter = vec3(0.0, 4.6, -1.5);
+    float lightR = 1.6;
+    vec3 target = lightCenter + sampleDisk(u) * lightR;
+    vec3 toLight = target - hitPos;
+    float dist = length(toLight);
+    vec3 lDir = toLight / dist;
+    float ndotl = max(dot(n, lDir), 0.0);
+    if (ndotl <= 0.0) return vec3(0.0);
+
+    Hit sh = traceScene(hitPos + n * 0.004, lDir, true);
+    if (sh.mat == 3) {
+        float atten = 28.0 / max(dist * dist, 6.0);
+        return shadePBR(hitPos, n, V, baseCol, rough, lDir, vec3(1.15, 1.10, 1.02) * atten);
+    }
+    return vec3(0.0);
+}
+
+vec3 shadePoolWater(vec3 hitPos, vec3 rd, vec3 wn) {
+    float cosTheta = clamp(dot(-rd, wn), 0.0, 1.0);
+    float fresnel = 0.03 + 0.97 * pow(1.0 - cosTheta, 5.0);
+
+    vec3 refrDir = refract(rd, wn, 1.0 / 1.333);
+    if (length(refrDir) < 0.001) refrDir = rd;
+    float depth = 1.35;
+    float tFloor = depth / max(abs(refrDir.y), 0.15);
+    vec3 bottomPos = hitPos + refrDir * tFloor;
+
+    float tile = mod(floor(bottomPos.x * 2.5) + floor(bottomPos.z * 2.5), 2.0);
+    vec3 tileCol = mix(vec3(0.10, 0.55, 0.65), vec3(0.06, 0.36, 0.45), tile);
+    float caustic = getWaterCaustic(bottomPos.xz, timeSec);
+    vec3 underWater = tileCol * (0.28 + caustic * 0.85);
+
+    if (s4.w > 0.0) {
+        float dL = length(s4.xyz - hitPos);
+        if (dL < 10.0) underWater += tileCol * vec3(1.15, 1.02, 0.78) * (7.0 / max(dL * dL, 0.6)) * (0.6 + caustic * 0.6);
+    }
+    if (flashlight == 1) {
+        vec3 spotDir = normalize(camRot * vec3(0.0, 0.0, -1.0));
+        vec3 toW = hitPos - camPos;
+        float dF = length(toW);
+        float cA = dot(toW / dF, spotDir);
+        if (cA > 0.84 && dF < 16.0) {
+            underWater += tileCol * vec3(1.1) * smoothstep(0.84, 0.96, cA) * (16.0 / max(dF * dF, 1.2));
+        }
+    }
+
+    underWater *= exp(-vec3(0.32, 0.09, 0.06) * tFloor);
+
+    vec3 reflDir = reflect(rd, wn);
+    Hit reflHit = traceScene(hitPos + vec3(0.0, 0.01, 0.0), reflDir, false);
+    vec3 reflCol = vec3(0.04, 0.14, 0.18);
+    if (reflHit.t < 1e8) {
+        if (length(reflHit.emit) > 0.1) {
+            reflCol = reflHit.emit;
+        } else {
+            vec3 rp = hitPos + reflDir * reflHit.t;
+            reflCol = computeRoomGI(rp, reflHit.n, -reflDir, reflHit.col, reflHit.rough);
+        }
+    }
+
+    return mix(underWater, reflCol, clamp(fresnel * 1.15, 0.04, 0.92));
+}
+
+void main() {
+    vec3 totalRad = vec3(0.0);
+    float n1 = ign(gl_FragCoord.xy, frame);
+    float n2 = ign(gl_FragCoord.xy + vec2(17.0, 31.0), frame + 1.0);
+
+    for (int s = 0; s < spp; s++) {
+        float fs = float(s);
+        vec2 jitter = vec2(fract(n1 + fs * 0.6180339), fract(n2 + fs * 0.381966)) - 0.5;
+        vec2 uv = (gl_FragCoord.xy + jitter - 0.5 * res) / res.y;
+        vec3 ro = camPos;
+        vec3 rd = normalize(camRot * vec3(uv, -1.0));
+        vec3 throughput = vec3(1.0);
+        vec3 radiance = vec3(0.0);
+
+        for (int bounce = 0; bounce < maxBounces; bounce++) {
+            Hit h = traceScene(ro, rd, bounce == 0);
+            if (h.t > 1e8) break;
+
+            if (h.mat == 3 || length(h.emit) > 0.1) {
+                radiance += throughput * h.emit;
+                if (h.mat == 3) break;
+            }
+
+            vec3 hitPos = ro + rd * h.t;
+            if (h.mat == 1) {
+                ro = hitPos + h.n * 0.002;
+                rd = reflect(rd, h.n);
+                throughput *= h.col;
+            } else if (h.mat == 2) {
+                float rim = pow(1.0 - abs(dot(rd, h.n)), 4.0);
+                radiance += throughput * vec3(0.45, 0.55, 0.65) * rim * 0.6;
+                vec3 toCenter = normalize(s0.xyz - hitPos);
+                vec3 exitPoint = s0.xyz + rd * s0.w;
+                ro = exitPoint + rd * 0.005;
+                rd = normalize(mix(rd, toCenter, 0.08));
+                throughput *= vec3(0.97, 0.99, 1.0);
+                bounce--;
+            } else if (h.mat == 4) {
+                radiance += throughput * shadePoolWater(hitPos, rd, h.n);
+                break;
+            } else {
+                vec2 lightU = vec2(fract(n1 + fs * 0.754877), fract(n2 + fs * 0.569840));
+                vec3 V = -rd;
+                vec3 direct = computeDirectLight(hitPos, h.n, V, h.col, h.rough, lightU);
+                vec3 indirect = computeRoomGI(hitPos, h.n, V, h.col, h.rough);
+                radiance += throughput * (direct + indirect);
+                break;
+            }
+        }
+        totalRad += radiance;
+    }
+
+    vec3 sampleCol = totalRad / float(spp);
+    vec3 prev = texelFetch(prevFrame, ivec2(gl_FragCoord.xy), 0).rgb;
+    vec3 acc = mix(prev, sampleCol, blendWeight);
+    fragColor = vec4(acc, 1.0);
+}`;
+
+const postFs = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+uniform sampler2D tex;
+uniform vec2 res;
+uniform float frame;
+
+vec3 acesToneMap(vec3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    vec3 mapped = clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+    return pow(mapped, vec3(1.0 / 2.2));
+}
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec3 center = texelFetch(tex, p, 0).rgb;
+
+    vec2 centerDist = abs(gl_FragCoord.xy - res * 0.5);
+    if (centerDist.x < 1.8 && centerDist.y < 1.8) {
+        fragColor = vec4(1.0, 1.0, 1.0, 1.0);
+        return;
+    }
+
+    vec3 finalCol = center;
+
+    if (frame < 8.0) {
+        vec3 sum = vec3(0.0);
+        float wSum = 0.0;
+        for (int x = -1; x <= 1; x++) {
+            for (int y = -1; y <= 1; y++) {
+                vec3 c = texelFetch(tex, p + ivec2(x, y), 0).rgb;
+                float diff = length(c - center) / (1.0 + length(center));
+                float w = exp(-float(x*x + y*y) * 0.5) * exp(-diff * 8.0);
+                sum += c * w;
+                wSum += w;
+            }
+        }
+        finalCol = sum / max(wSum, 0.0001);
+    }
+
+    vec3 n = texelFetch(tex, p + ivec2(0,  1), 0).rgb;
+    vec3 s = texelFetch(tex, p + ivec2(0, -1), 0).rgb;
+    vec3 e = texelFetch(tex, p + ivec2( 1, 0), 0).rgb;
+    vec3 w = texelFetch(tex, p + ivec2(-1, 0), 0).rgb;
+    vec3 blur = (n + s + e + w) * 0.25;
+    vec3 sharpCol = finalCol + (finalCol - blur) * 0.42;
+
+    fragColor = vec4(acesToneMap(max(sharpCol, vec3(0.0))), 1.0);
+}`;
+
+function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        gpuEl.style.color = '#ff4444';
+        gpuEl.textContent = 'Ошибка шейдера: ' + gl.getShaderInfoLog(s);
+    }
+    return s;
+}
+function link(v, f) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, v));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, f));
+    gl.bindAttribLocation(p, 0, 'p');
+    gl.linkProgram(p); return p;
+}
+
+const prog = link(vs, fs);
+const postProg = link(vs, postFs);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(new Array(-1.0,-1.0, 1.0,-1.0, -1.0,1.0, 1.0,1.0)), gl.STATIC_DRAW);
+
+gl.getExtension('EXT_color_buffer_float');
+function makeTex() {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, canvas.width, canvas.height, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+}
+let texA = makeTex(), texB = makeTex();
+const fbo = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+gl.clearColor(0.0, 0.0, 0.0, 1.0);
+for (let i = 0; i < 2; i++) {
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, i === 0 ? texA : texB, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+}
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+let frame = 0, totalSamples = 0;
+
+let camX = 0.0, camY = -0.05, camZ = 1.5;
+let velY = 0.0;
+let onGround = true;
+let yaw = 0.0, pitch = -0.04;
+let targetYaw = 0.0, targetPitch = -0.04;
+let walkPhase = 0.0;
+let flashlightOn = false;
+const keys = new Map();
+
+const balls = new Array(
+    { x:  0.0, y: -0.52, z: -4.2, r: 0.48, vx: 0, vy: 0, vz: 0 },
+    { x: -1.6, y: -0.48, z: -4.8, r: 0.52, vx: 0, vy: 0, vz: 0 },
+    { x:  1.6, y: -0.55, z: -4.5, r: 0.45, vx: 0, vy: 0, vz: 0 },
+    { x: -0.6, y: -0.64, z: -2.8, r: 0.36, vx: 0, vy: 0, vz: 0 },
+    { x: -3.2, y: -0.68, z: -4.8, r: 0.32, vx: 0, vy: 0, vz: 0 }
+);
+let grabbedBall = null;
+
+function resetBalls() {
+    const b0 = balls.at(0); b0.x = 0.0;  b0.y = -0.52; b0.z = -4.2; b0.vx = b0.vy = b0.vz = 0;
+    const b1 = balls.at(1); b1.x = -1.6; b1.y = -0.48; b1.z = -4.8; b1.vx = b1.vy = b1.vz = 0;
+    const b2 = balls.at(2); b2.x = 1.6;  b2.y = -0.55; b2.z = -4.5; b2.vx = b2.vy = b2.vz = 0;
+    const b3 = balls.at(3); b3.x = -0.6; b3.y = -0.64; b3.z = -2.8; b3.vx = b3.vy = b3.vz = 0;
+    const b4 = balls.at(4); b4.x = -3.2; b4.y = -0.68; b4.z = -4.8; b4.vx = b4.vy = b4.vz = 0;
+    grabbedBall = null;
+    frame = 0;
+}
+
+function isWaterVisible() {
+    if (camX > -9.2) return false;
+    if (camX < -21.2) return true;
+
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const lookX = -sy * cp, lookY = sp, lookZ = -cy * cp;
+
+    const dx1 = -21.0 - camX, dy1 = -0.2 - camY, dz1 = 0.0 - camZ;
+    const d1 = Math.hypot(dx1, dy1, dz1);
+    const dotDoor = (dx1 * lookX + dy1 * lookY + dz1 * lookZ) / d1;
+
+    const dx2 = -28.0 - camX, dy2 = -1.0 - camY, dz2 = 0.0 - camZ;
+    const d2 = Math.hypot(dx2, dy2, dz2);
+    const dotPool = (dx2 * lookX + dy2 * lookY + dz2 * lookZ) / d2;
+
+    return dotDoor > 0.38 || dotPool > 0.42;
+}
+
+function resolveRoomBounds(obj, radius, isPlayer) {
+    obj.x = Math.max(-34.0 + radius, Math.min(20.0 - radius, obj.x));
+    obj.z = Math.max(-8.0 + radius, Math.min(8.0 - radius, obj.z));
+
+    const wallsX = new Array(-6.0, 6.0, -10.0, 10.0);
+    for (let i = 0; i < wallsX.length; i++) {
+        const wx = wallsX.at(i);
+        const dx = obj.x - wx;
+        if (Math.abs(dx) < radius) {
+            if (obj.z - radius < -6.8 || obj.z + radius > -3.2) {
+                const sign = dx >= 0 ? 1 : -1;
+                obj.x = wx + sign * radius;
+                if (!isPlayer) obj.vx = sign * Math.abs(obj.vx) * 0.7;
+            }
+        }
+    }
+
+    if ((obj.x > -10.0 - radius * 0.5 && obj.x < -6.0 + radius * 0.5) ||
+        (obj.x >  6.0 - radius * 0.5 && obj.x < 10.0 + radius * 0.5)) {
+        if (obj.z - radius < -6.8) {
+            obj.z = -6.8 + radius;
+            if (!isPlayer) obj.vz = Math.abs(obj.vz) * 0.7;
+        }
+        if (obj.z + radius > -3.2) {
+            obj.z = -3.2 - radius;
+            if (!isPlayer) obj.vz = -Math.abs(obj.vz) * 0.7;
+        }
+    }
+
+    const poolWalls = new Array(-20.0, -22.0);
+    for (let i = 0; i < poolWalls.length; i++) {
+        const wx = poolWalls.at(i);
+        const dx = obj.x - wx;
+        if (Math.abs(dx) < radius) {
+            if (obj.z - radius < -2.0 || obj.z + radius > 2.0) {
+                const sign = dx >= 0 ? 1 : -1;
+                obj.x = wx + sign * radius;
+                if (!isPlayer) obj.vx = sign * Math.abs(obj.vx) * 0.7;
+            }
+        }
+    }
+    if (obj.x > -22.0 - radius * 0.5 && obj.x < -20.0 + radius * 0.5) {
+        if (obj.z - radius < -2.0) { obj.z = -2.0 + radius; if (!isPlayer) obj.vz = Math.abs(obj.vz) * 0.7; }
+        if (obj.z + radius >  2.0) { obj.z =  2.0 - radius; if (!isPlayer) obj.vz = -Math.abs(obj.vz) * 0.7; }
+    }
+
+    const cols = new Array({ x: 13.2, z: -2.2, r: 0.42 }, { x: 13.2, z: 2.5, r: 0.42 });
+    for (let i = 0; i < cols.length; i++) {
+        const c = cols.at(i);
+        const dx = obj.x - c.x;
+        const dz = obj.z - c.z;
+        const d = Math.hypot(dx, dz);
+        const minD = radius + c.r;
+        if (d < minD && d > 0.0001) {
+            const nx = dx / d, nz = dz / d;
+            obj.x = c.x + nx * minD;
+            obj.z = c.z + nz * minD;
+            if (!isPlayer) {
+                const vn = obj.vx * nx + obj.vz * nz;
+                if (vn < 0) {
+                    obj.vx -= 1.7 * vn * nx;
+                    obj.vz -= 1.7 * vn * nz;
+                }
+            }
+        }
+    }
+}
+
+canvas.addEventListener('mousedown', e => {
+    if (document.pointerLockElement !== canvas) {
+        canvas.requestPointerLock();
+        return;
+    }
+    if (e.button === 0) {
+        if (grabbedBall) {
+            const cy = Math.cos(yaw), sy = Math.sin(yaw);
+            const cp = Math.cos(pitch), sp = Math.sin(pitch);
+            grabbedBall.vx = -sy * cp * 6.5;
+            grabbedBall.vy = sp * 6.5 + 1.8;
+            grabbedBall.vz = -cy * cp * 6.5;
+            grabbedBall = null;
+            frame = 0;
+        } else {
+            const cy = Math.cos(yaw), sy = Math.sin(yaw);
+            const cp = Math.cos(pitch), sp = Math.sin(pitch);
+            const rdx = -sy * cp, rdy = sp, rdz = -cy * cp;
+            let bestDist = 5.5;
+            for (let i = 0; i < balls.length; i++) {
+                const b = balls.at(i);
+                const ocx = b.x - camX, ocy = b.y - camY, ocz = b.z - camZ;
+                const proj = ocx * rdx + ocy * rdy + ocz * rdz;
+                if (proj > 0 && proj < bestDist) {
+                    const distSq = (ocx*ocx + ocy*ocy + ocz*ocz) - proj*proj;
+                    if (distSq < (b.r + 0.24) * (b.r + 0.24)) {
+                        bestDist = proj;
+                        grabbedBall = b;
+                    }
+                }
+            }
+        }
+    }
+});
+
+window.addEventListener('keydown', e => {
+    keys.set(e.code, true);
+    if (e.code === 'Space' && onGround && document.pointerLockElement === canvas) {
+        velY = 4.6;
+        onGround = false;
+    }
+    if (e.code === 'KeyE' && grabbedBall) {
+        grabbedBall.vx = 0;
+        grabbedBall.vy = 0;
+        grabbedBall.vz = 0;
+        grabbedBall = null;
+        frame = 0;
+    }
+    if (e.code === 'KeyF') {
+        flashlightOn = !flashlightOn;
+        flashEl.textContent = flashlightOn ? 'Фонарик [F]: ВКЛ' : 'Фонарик [F]: ВЫКЛ';
+        frame = 0;
+    }
+    if (e.code === 'KeyR') resetBalls();
+});
+window.addEventListener('keyup', e => keys.set(e.code, false));
+window.addEventListener('mousemove', e => {
+    if (document.pointerLockElement === canvas) {
+        targetYaw -= e.movementX * 0.0022;
+        targetPitch = Math.max(-1.45, Math.min(1.45, targetPitch - e.movementY * 0.0022));
+    }
+});
+
+function getCamMatrix() {
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    return new Float32Array(new Array(
+        cy, 0, -sy,
+        sy * sp, cp, cy * sp,
+        sy * cp, -sp, cy * cp
+    ));
+}
+
+let startTime = performance.now();
+let lastFrameTime = performance.now();
+let lastFpsUpdate = performance.now(), framesCount = 0, currentFps = 0;
+
+function render(now) {
+    const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameTime) / 1000));
+    const timeSec = (now - startTime) / 1000;
+    lastFrameTime = now;
+
+    framesCount++;
+    if (now - lastFpsUpdate >= 400) {
+        currentFps = Math.round(framesCount * 1000 / (now - lastFpsUpdate));
+        framesCount = 0;
+        lastFpsUpdate = now;
+    }
+
+    let needResetFrame = false;
+
+    const dYaw = targetYaw - yaw;
+    const dPitch = targetPitch - pitch;
+    if (Math.abs(dYaw) > 0.00005 || Math.abs(dPitch) > 0.00005) {
+        yaw += dYaw * 0.45;
+        pitch += dPitch * 0.45;
+        needResetFrame = true;
+    } else {
+        yaw = targetYaw;
+        pitch = targetPitch;
+    }
+
+    const speed = 4.6 * dt;
+    const fwdX = -Math.sin(yaw), fwdZ = -Math.cos(yaw);
+    const rightX = Math.cos(yaw), rightZ = -Math.sin(yaw);
+    let isWalking = false;
+
+    if (keys.get('KeyW')) { camX += fwdX * speed; camZ += fwdZ * speed; needResetFrame = true; isWalking = true; }
+    if (keys.get('KeyS')) { camX -= fwdX * speed; camZ -= fwdZ * speed; needResetFrame = true; isWalking = true; }
+    if (keys.get('KeyD')) { camX += rightX * speed; camZ += rightZ * speed; needResetFrame = true; isWalking = true; }
+    if (keys.get('KeyA')) { camX -= rightX * speed; camZ -= rightZ * speed; needResetFrame = true; isWalking = true; }
+
+    if (isWalking && onGround) {
+        walkPhase += dt * 11.0;
+    } else {
+        walkPhase *= 0.85;
+    }
+
+    if (!onGround) {
+        velY -= 11.5 * dt;
+        camY += velY * dt;
+        if (camY <= -0.05) {
+            camY = -0.05;
+            velY = 0.0;
+            onGround = true;
+        }
+        needResetFrame = true;
+    }
+
+    const pObj = { x: camX, z: camZ, vx: 0, vz: 0 };
+    resolveRoomBounds(pObj, 0.38, true);
+    camX = pObj.x; camZ = pObj.z;
+
+    for (let i = 0; i < balls.length; i++) {
+        const b = balls.at(i);
+
+        if (b === grabbedBall) {
+            const cy = Math.cos(yaw), sy = Math.sin(yaw);
+            const cp = Math.cos(pitch), sp = Math.sin(pitch);
+            b.x = camX - sy * cp * 1.45;
+            b.y = Math.max(-1.0 + b.r, Math.min(2.2 - b.r, camY + sp * 1.45));
+            b.z = camZ - cy * cp * 1.45;
+            b.vx = b.vy = b.vz = 0;
+            resolveRoomBounds(b, b.r, false);
+            needResetFrame = true;
+        } else {
+            if (Math.abs(b.vx) < 0.025 && Math.abs(b.vz) < 0.025 && Math.abs(b.vy) < 0.05 && b.y <= -1.0 + b.r + 0.005) {
+                b.vx = b.vy = b.vz = 0;
+                b.y = -1.0 + b.r;
+            } else {
+                b.vy -= 9.8 * dt;
+                b.x += b.vx * dt;
+                b.y += b.vy * dt;
+                b.z += b.vz * dt;
+                const friction = Math.pow(0.12, dt);
+                b.vx *= friction;
+                b.vz *= friction;
+
+                const inCor = (Math.abs(b.x) > 6.0 && Math.abs(b.x) < 10.0) || (b.x > -22.0 && b.x < -20.0);
+                const maxCeiling = inCor ? 2.4 : 3.2;
+                if (b.y - b.r <= -1.0) {
+                    b.y = -1.0 + b.r;
+                    b.vy = Math.abs(b.vy) > 0.35 ? Math.abs(b.vy) * 0.5 : 0;
+                }
+                if (b.y + b.r > maxCeiling) { b.y = maxCeiling - b.r; b.vy = -Math.abs(b.vy) * 0.5; }
+                resolveRoomBounds(b, b.r, false);
+                needResetFrame = true;
+            }
+
+            const dx = b.x - camX, dz = b.z - camZ;
+            const dist = Math.hypot(dx, dz);
+            const minDist = b.r + 0.38;
+            if (dist < minDist && dist > 0.001 && camY - 0.90 < b.y + b.r && camY + 0.25 > b.y - b.r) {
+                const overlap = minDist - dist;
+                const nx = dx / dist, nz = dz / dist;
+                b.x += nx * overlap * 0.75;
+                b.z += nz * overlap * 0.75;
+                camX -= nx * overlap * 0.25;
+                camZ -= nz * overlap * 0.25;
+                b.vx += nx * 3.2;
+                b.vz += nz * 3.2;
+                resolveRoomBounds(b, b.r, false);
+                needResetFrame = true;
+            }
+        }
+    }
+
+    for (let iter = 0; iter < 3; iter++) {
+        for (let i = 0; i < balls.length; i++) {
+            for (let j = i + 1; j < balls.length; j++) {
+                const a = balls.at(i), b = balls.at(j);
+                const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+                const d = Math.hypot(dx, dy, dz);
+                const minD = a.r + b.r;
+                if (d < minD - 0.001 && d > 0.0001) {
+                    const ov = (minD - d) * 0.5;
+                    const nx = dx / d, ny = dy / d, nz = dz / d;
+if (a !== grabbedBall) { a.x -= nx * ov; a.y -= ny * ov; a.z -= nz * ov; a.vx -= nx * 1.4; a.vz -= nz * 1.4; resolveRoomBounds(a, a.r, false); }
+if (b !== grabbedBall) { b.x += nx * ov; b.y += ny * ov; b.z += nz * ov; b.vx += nx * 1.4; b.vz += nz * 1.4; resolveRoomBounds(b, b.r, false); }
+needResetFrame = true;
+}
+}
+}
+}
+const waterVis = isWaterVisible();
+if (needResetFrame) frame = 0;
+if (frame === 0) totalSamples = 0;
+let blendWeight = waterVis ? 0.35 : ((frame === 0) ? 0.65 : (1.0 / (frame + 1.0)));
+let currentSpp = (frame < 3) ? 4 : 8;
+gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texB, 0);
+gl.viewport(0, 0, canvas.width, canvas.height);
+gl.useProgram(prog);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.uniform2f(gl.getUniformLocation(prog, 'res'), canvas.width, canvas.height);
+gl.uniform1f(gl.getUniformLocation(prog, 'frame'), frame);
+gl.uniform1f(gl.getUniformLocation(prog, 'timeSec'), timeSec);
+gl.uniform1f(gl.getUniformLocation(prog, 'blendWeight'), blendWeight);
+gl.uniform1f(gl.getUniformLocation(prog, 'walkPhase'), walkPhase);
+gl.uniform1i(gl.getUniformLocation(prog, 'spp'), currentSpp);
+gl.uniform1i(gl.getUniformLocation(prog, 'maxBounces'), 6);
+gl.uniform1i(gl.getUniformLocation(prog, 'flashlight'), flashlightOn ? 1 : 0);
+gl.uniform1i(gl.getUniformLocation(prog, 'waterActive'), waterVis ? 1 : 0);
+gl.uniform3f(gl.getUniformLocation(prog, 'camPos'), camX, camY, camZ);
+gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'camRot'), false, getCamMatrix());
+const b0 = balls.at(0), b1 = balls.at(1), b2 = balls.at(2), b3 = balls.at(3), b4 = balls.at(4);
+gl.uniform4f(gl.getUniformLocation(prog, 's0'), b0.x, b0.y, b0.z, b0.r);
+gl.uniform4f(gl.getUniformLocation(prog, 's1'), b1.x, b1.y, b1.z, b1.r);
+gl.uniform4f(gl.getUniformLocation(prog, 's2'), b2.x, b2.y, b2.z, b2.r);
+gl.uniform4f(gl.getUniformLocation(prog, 's3'), b3.x, b3.y, b3.z, b3.r);
+gl.uniform4f(gl.getUniformLocation(prog, 's4'), b4.x, b4.y, b4.z, b4.r);
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D, texA);
+gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+gl.viewport(0, 0, canvas.width, canvas.height);
+gl.useProgram(postProg);
+gl.bindTexture(gl.TEXTURE_2D, texB);
+gl.uniform2f(gl.getUniformLocation(postProg, 'res'), canvas.width, canvas.height);
+gl.uniform1f(gl.getUniformLocation(postProg, 'frame'), frame);
+gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+const tmp = texA; texA = texB; texB = tmp;
+frame++;
+totalSamples += currentSpp;
+fpsEl.textContent = `FPS: ${currentFps} | Сэмплов: ${totalSamples}`;
+waterEl.textContent = waterVis ? 'Вода: АКТИВНА' : 'Вода: СКРЫТА';
+if (frame > 2 && loadOverlay.style.display !== 'none') loadOverlay.style.display = 'none';
+requestAnimationFrame(render);
+}
+
+const extParallel = gl.getExtension('KHR_parallel_shader_compile');
+function startGameLoop() {
+    startTime = performance.now();
+    lastFrameTime = performance.now();
+    requestAnimationFrame(render);
+}
+function bootGame() {
+    if (extParallel) {
+        const readyA = gl.getProgramParameter(prog, gl.COMPLETION_STATUS_KHR);
+        const readyB = gl.getProgramParameter(postProg, gl.COMPLETION_STATUS_KHR);
+        if (!(readyA && readyB)) { setTimeout(bootGame, 60); return; }
+    }
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS) || !gl.getProgramParameter(postProg, gl.LINK_STATUS)) {
+        gpuEl.style.color = '#ff4444';
+        gpuEl.textContent = 'ОШИБКА ЛИНКОВКИ: ' + gl.getProgramInfoLog(prog) + ' || ' + gl.getProgramInfoLog(postProg);
+        loadOverlay.textContent = 'Ошибка линковки шейдеров - подробности в строке GPU';
+        return;
+    }
+    startGameLoop();
+}
+bootGame();
+
+</script>
+</body>
+</html>
