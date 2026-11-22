@@ -41,16 +41,23 @@
 </div>
 
 <script>
-const canvas = document.getElementById('c');
 const loadOverlay = document.getElementById('loadOverlay');
-let gl = canvas.getContext('webgl2', { powerPreference: 'high-performance', antialias: false });
-if (!gl) gl = canvas.getContext('webgl2');
+let canvas = document.getElementById('c');
+let gl = null;
+const ctxVariants = [null, { antialias: false }, { powerPreference: 'high-performance', antialias: false }];
+for (let i = 0; i < ctxVariants.length; i++) {
+    gl = ctxVariants[i] ? canvas.getContext('webgl2', ctxVariants[i]) : canvas.getContext('webgl2');
+    if (gl) break;
+    const cv = canvas.cloneNode(false);
+    canvas.parentNode.replaceChild(cv, canvas);
+    canvas = cv;
+}
 if (!gl) {
     loadOverlay.style.whiteSpace = 'pre-line';
     loadOverlay.style.textAlign = 'center';
     loadOverlay.style.padding = '0 24px';
     loadOverlay.style.color = '#ff5555';
-    loadOverlay.textContent = 'WebGL2 не запустился в этом браузере.\n\nПолностью закрой ВСЕ окна браузера и открой файл заново — после прошлых фризов браузер отключает GPU-ускорение до перезапуска.\n\nЕсли снова не работает — перезагрузи ПК или обнови драйвер видеокарты.';
+    loadOverlay.textContent = 'WebGL2 отключён в этом браузере — обычно браузер так блокирует видеокарту после прошлых сбоев драйвера, игра тут ни при чём.\n\n1) Перезагрузи ПК и открой файл заново.\n2) Не помогло: открой chrome://gpu (в Edge — edge://gpu). Если у WebGL стоит Disabled — включи в настройках браузера аппаратное ускорение и перезапусти его.\n3) Или открой файл в другом браузере (Chrome / Edge / Firefox).';
     throw new Error('WebGL2 context unavailable');
 }
 const fpsEl = document.getElementById('fps');
@@ -853,6 +860,15 @@ for (let i = 0; i < 2; i++) {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, i === 0 ? texA : texB, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 }
+if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+    gpuEl.style.color = '#ff4444';
+    gpuEl.textContent = 'ОШИБКА: буфер RGBA32F не поддержан драйвером (Framebuffer incomplete)';
+    loadOverlay.style.color = '#ff5555';
+    loadOverlay.style.whiteSpace = 'pre-line';
+    loadOverlay.style.textAlign = 'center';
+    loadOverlay.textContent = 'Видеодрайвер не поддерживает формат RGBA32F.\n\nОбнови драйвер видеокарты и открой файл заново, либо попробуй другой браузер.';
+    throw new Error('RGBA32F framebuffer incomplete');
+}
 gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 let frame = 0, totalSamples = 0;
 
@@ -1223,16 +1239,31 @@ requestAnimationFrame(render);
 }
 
 const extParallel = gl.getExtension('KHR_parallel_shader_compile');
+let asyncQuery = null;
+if (extParallel && typeof gl.COMPLETION_STATUS_KHR === 'number') {
+    gl.getError();
+    const probe = gl.getProgramParameter(postProg, gl.COMPLETION_STATUS_KHR);
+    if (gl.getError() === gl.NO_ERROR && (probe === true || probe === false)) asyncQuery = gl.COMPLETION_STATUS_KHR;
+}
 function startGameLoop() {
     startTime = performance.now();
     lastFrameTime = performance.now();
     requestAnimationFrame(render);
 }
+let bootTries = 0;
 function bootGame() {
-    if (extParallel) {
-        const readyA = gl.getProgramParameter(prog, gl.COMPLETION_STATUS_KHR);
-        const readyB = gl.getProgramParameter(postProg, gl.COMPLETION_STATUS_KHR);
-        if (!(readyA && readyB)) { setTimeout(bootGame, 60); return; }
+    if (asyncQuery !== null && bootTries < 500) {
+        bootTries++;
+        const readyA = gl.getProgramParameter(prog, asyncQuery);
+        const readyB = gl.getProgramParameter(postProg, asyncQuery);
+        const okA = (readyA === true || readyA === false);
+        const okB = (readyB === true || readyB === false);
+        if (!okA || !okB) {
+            asyncQuery = null;
+        } else if (!(readyA && readyB)) {
+            setTimeout(bootGame, 60);
+            return;
+        }
     }
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS) || !gl.getProgramParameter(postProg, gl.LINK_STATUS)) {
         gpuEl.style.color = '#ff4444';
