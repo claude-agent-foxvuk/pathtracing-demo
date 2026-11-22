@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>3D Path Tracing Showcase (4 Rooms + Water Pool + Culling)</title>
+<title>3D Path Tracing Showcase (4 комнаты + настоящий бассейн)</title>
 <style>
   body { margin: 0; background: #0a0a0a; color: #eee; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; user-select: none; }
   canvas { width: 920px; height: 575px; border: 1px solid #333; box-shadow: 0 0 40px rgba(0,0,0,0.95); cursor: crosshair; }
@@ -21,7 +21,7 @@
 <div class="hud">
   <span id="fps">FPS: 0 | Сэмплов: 0</span>
   <span>|</span>
-  <span class="cull" id="waterInfo">Вода: СКРЫТА</span>
+  <span class="cull" id="waterInfo">Вода: штиль</span>
   <span>|</span>
   <span class="flash" id="flashInfo">Фонарик [F]: ВЫКЛ</span>
   <span>|</span>
@@ -31,13 +31,14 @@
 </div>
 <div class="controls">
   <span><b>Клик</b> — мышь</span>
-  <span><b>W A S D</b> — ходить</span>
-  <span><b>Space</b> — прыжок</span>
+  <span><b>W A S D</b> — ходить / плыть</span>
+  <span><b>Space</b> — прыжок / плыть вверх</span>
+  <span><b>C</b> — нырять</span>
   <span><b>F</b> — фонарик</span>
   <span><b>ЛКМ</b> — взять/кинуть шар или лампу</span>
   <span><b>E</b> — положить</span>
-  <span><b>R</b> — сброс объектов</span>
-  <span><b>ESC</b> — выход</span>
+  <span><b>R</b> — сброс шаров (вода остаётся)</span>
+  <span>у бортика жми <b>W</b>, чтобы выбраться</span>
 </div>
 
 <script>
@@ -78,6 +79,61 @@ const vs = `#version 300 es
 in vec2 p;
 void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
 
+// ================== СИМУЛЯЦИЯ ВОДЫ ==================
+// Настоящее волновое уравнение на сетке 160x220 (пул 8 x 11 м, ячейка 5 см).
+// h(t+1) = (соседи h(t)) / 2 - h(t-1), с затуханием. CLAMP_TO_EDGE = отражение
+// волн от стенок бассейна. Всплески вписываются как импульсы, рябь живёт сама.
+const simFs = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+uniform sampler2D curTex;
+uniform sampler2D prevTex;
+uniform vec2 simRes;
+uniform vec2 poolOrigin;
+uniform vec2 poolSize;
+uniform float damp;
+uniform float tick;
+uniform int nImp;
+uniform vec4 imp[8];
+uniform vec4 wake;
+
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+void main() {
+    vec2 uv = gl_FragCoord.xy / simRes;
+    vec2 px = 1.0 / simRes;
+    float c = texture(curTex, uv).r;
+    float p = texture(prevTex, uv).r;
+    float hl = texture(curTex, uv - vec2(px.x, 0.0)).r;
+    float hr = texture(curTex, uv + vec2(px.x, 0.0)).r;
+    float hd = texture(curTex, uv - vec2(0.0, px.y)).r;
+    float hu = texture(curTex, uv + vec2(0.0, px.y)).r;
+    float nh = (hl + hr + hd + hu) * 0.5 - p;
+    // едва заметное дрожание поверхности, чтобы вода никогда не была мёртвой
+    float n1 = hash12(uv * simRes + vec2(tick * 7.13, tick * 3.71));
+    nh += (n1 - 0.5) * 0.0011;
+    vec2 wp = uv * poolSize + poolOrigin;
+    // кильватерный след от пловца
+    if (wake.z != 0.0) {
+        vec2 dw = wp - wake.xy;
+        nh += wake.z * exp(-dot(dw, dw) * 2.2);
+    }
+    // всплески от шаров / прыжков
+    for (int i = 0; i < 8; i++) {
+        if (i >= nImp) break;
+        vec2 di = wp - imp[i].xy;
+        float ri = imp[i].z;
+        nh += imp[i].w * exp(-dot(di, di) / (ri * ri));
+    }
+    nh *= damp;
+    fragColor = vec4(clamp(nh, -0.20, 0.13), 0.0, 0.0, 1.0);
+}`;
+
+// ================== ПУТЕВОЙ ТРАССИРОВЩИК ==================
 const fs = `#version 300 es
 precision highp float;
 out vec4 fragColor;
@@ -89,7 +145,6 @@ uniform float walkPhase;
 uniform int spp;
 uniform int maxBounces;
 uniform int flashlight;
-uniform int waterActive;
 uniform vec3 camPos;
 uniform mat3 camRot;
 uniform vec4 s0;
@@ -98,6 +153,16 @@ uniform vec4 s2;
 uniform vec4 s3;
 uniform vec4 s4;
 uniform sampler2D prevFrame;
+uniform sampler2D waterTex;
+uniform int nFoam;
+uniform vec4 foamImp[4];
+
+const vec2 POOL_MIN = vec2(-32.0, -5.5);
+const vec2 POOL_MAX = vec2(-24.0, 5.5);
+const float WLEVEL = -1.06;
+const float POOL_BOT = -2.5;
+const vec3 POOL_LAMP = vec3(-28.0, 3.05, 0.0);
+const vec3 W_ABSORB = vec3(0.45, 0.13, 0.10);
 
 float ign(vec2 p, float f) {
     p += f * vec2(5.588238, 5.588238);
@@ -137,26 +202,20 @@ Hit intersectCapsule(vec3 ro, vec3 rd, vec3 pa, vec3 pb, float r, vec3 col, vec3
     float b = baba * rdoa - baoa * bard;
     float c = baba * oaoa - baoa * baoa - r * r * baba;
     float h = b * b - a * c;
-    if (h >= 0.0) {
+    if (abs(a) > 1e-6 && h >= 0.0) {
         float t = (-b - sqrt(h)) / a;
         float y = baoa + t * bard;
         if (y > 0.0 && y < baba && t > 0.001) {
             vec3 n = (oa + t * rd - ba * y / baba) / r;
             return Hit(t, n, col, emit, mat, rough);
         }
-        vec3 oc = (y <= 0.0) ? oa : ro - pb;
-        b = dot(rd, oc);
-        c = dot(oc, oc) - r * r;
-        h = b * b - c;
-        if (h > 0.0) {
-            t = -b - sqrt(h);
-            if (t > 0.001) {
-                vec3 n = (oc + t * rd) / r;
-                return Hit(t, n, col, emit, mat, rough);
-            }
-        }
     }
-    return Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    Hit best = Hit(1e9, vec3(0.0), vec3(0.0), vec3(0.0), 0, 1.0);
+    Hit h1 = intersectSphere(ro, rd, pa, r, col, emit, mat, rough);
+    if (h1.t < best.t) best = h1;
+    Hit h2 = intersectSphere(ro, rd, pb, r, col, emit, mat, rough);
+    if (h2.t < best.t) best = h2;
+    return best;
 }
 
 Hit intersectCylinder(vec3 ro, vec3 rd, vec2 c, float r, float yMin, float yMax, vec3 col, int mat) {
@@ -187,28 +246,103 @@ bool inMap(vec3 p) {
     return false;
 }
 
-bool inPoolBasin(vec3 p) {
-    return (p.x >= -32.0 && p.x <= -24.0 && abs(p.z) <= 5.5);
+bool inPoolXZ(vec2 xz) {
+    return xz.x > POOL_MIN.x && xz.x < POOL_MAX.x && xz.y > POOL_MIN.y && xz.y < POOL_MAX.y;
 }
 
-vec3 getWaterNormal(vec2 p, float t) {
-    float w1 = sin(p.x * 2.8 + t * 2.4) * cos(p.y * 2.5 - t * 1.9);
-    float w2 = sin((p.x + p.y) * 4.5 - t * 3.1) * 0.5;
-    float w3 = cos((p.x - p.y * 1.3) * 7.2 + t * 4.0) * 0.25;
-    float dx = cos(p.x * 2.8 + t * 2.4) * 2.8 * cos(p.y * 2.5 - t * 1.9)
-             + cos((p.x + p.y) * 4.5 - t * 3.1) * 2.25
-             - sin((p.x - p.y * 1.3) * 7.2 + t * 4.0) * 1.8;
-    float dz = -sin(p.x * 2.8 + t * 2.4) * sin(p.y * 2.5 - t * 1.9) * 2.5
-             + cos((p.x + p.y) * 4.5 - t * 3.1) * 2.25
-             + sin((p.x - p.y * 1.3) * 7.2 + t * 4.0) * 2.34;
-    return normalize(vec3(-dx * 0.022, 1.0, -dz * 0.022));
+// ---- выборка реального волнового поля ----
+float waterH(vec2 xz) {
+    vec2 uvw = (xz - POOL_MIN) / (POOL_MAX - POOL_MIN);
+    return WLEVEL + texture(waterTex, uvw).r;
 }
 
-float getWaterCaustic(vec2 p, float t) {
-    float c1 = sin(p.x * 3.2 + t * 2.2) + cos(p.y * 3.4 - t * 2.0);
-    float c2 = sin((p.x - p.y) * 5.0 + t * 3.3);
-    float v = 1.0 - abs(c1 * 0.5 + c2 * 0.35);
-    return pow(clamp(v, 0.0, 1.0), 4.0);
+vec3 waterNormal(vec2 xz) {
+    float e = 0.05;
+    float hL = waterH(xz - vec2(e, 0.0));
+    float hR = waterH(xz + vec2(e, 0.0));
+    float hD = waterH(xz - vec2(0.0, e));
+    float hU = waterH(xz + vec2(0.0, e));
+    return normalize(vec3(hL - hR, 2.0 * e, hD - hU));
+}
+
+// Фокусировка света настоящими волнами: вогнутость поверхности (лапласиан
+// высоты) работает как линза - впадины собирают свет, гребни рассеивают.
+float causticFocus(vec2 xz) {
+    float e = 0.05;
+    float c = waterH(xz);
+    float l = waterH(xz - vec2(e, 0.0));
+    float r = waterH(xz + vec2(e, 0.0));
+    float d = waterH(xz - vec2(0.0, e));
+    float u = waterH(xz + vec2(0.0, e));
+    float lap = (l + r + d + u - 4.0 * c) * 16.0;
+    return clamp(1.0 + lap * 0.95, 0.30, 2.60);
+}
+
+vec3 poolTileColor(vec2 xz) {
+    float checker = mod(floor(xz.x * 2.0) + floor(xz.y * 2.0), 2.0);
+    vec3 tile = mix(vec3(0.16, 0.42, 0.52), vec3(0.23, 0.56, 0.65), checker);
+    vec2 g = abs(fract(xz * 2.0) - 0.5);
+    float line = (g.x < 0.045 || g.y < 0.045) ? 1.0 : 0.0;
+    return mix(tile, vec3(0.07, 0.18, 0.24), line * 0.75);
+}
+
+vec3 basinWallColor(vec3 q, float useZ) {
+    float u = mix(q.x, q.z, useZ);
+    vec2 g = vec2(abs(fract(u * 2.0) - 0.5), abs(fract(q.y * 2.0) - 0.5));
+    float line = (g.x < 0.045 || g.y < 0.045) ? 1.0 : 0.0;
+    return mix(vec3(0.20, 0.49, 0.58), vec3(0.07, 0.18, 0.24), line * 0.75);
+}
+
+// ---- пересечение луча с волновым полем ----
+Hit marchWater(vec3 ro, vec3 rd, Hit best) {
+    float bt = best.t;
+    float tEnter = 0.0;
+    float tExit = 1e9;
+    if (abs(rd.x) > 1e-6) {
+        float ta = (POOL_MIN.x - ro.x) / rd.x;
+        float tb = (POOL_MAX.x - ro.x) / rd.x;
+        tEnter = max(tEnter, min(ta, tb));
+        tExit = min(tExit, max(ta, tb));
+    } else if (ro.x < POOL_MIN.x || ro.x > POOL_MAX.x) return best;
+    if (abs(rd.z) > 1e-6) {
+        float ta = (POOL_MIN.y - ro.z) / rd.z;
+        float tb = (POOL_MAX.y - ro.z) / rd.z;
+        tEnter = max(tEnter, min(ta, tb));
+        tExit = min(tExit, max(ta, tb));
+    } else if (ro.z < POOL_MIN.y || ro.z > POOL_MAX.y) return best;
+    if (abs(rd.y) > 1e-6) {
+        float ta = (WLEVEL - 0.21 - ro.y) / rd.y;
+        float tb = (WLEVEL + 0.14 - ro.y) / rd.y;
+        tEnter = max(tEnter, min(ta, tb));
+        tExit = min(tExit, max(ta, tb));
+    } else if (ro.y < WLEVEL - 0.21 || ro.y > WLEVEL + 0.14) return best;
+    if (tEnter > tExit || tExit < 0.002 || tEnter > bt) return best;
+    float t = max(tEnter, 0.002);
+    float tEnd = min(tExit, bt);
+    float stepLen = 0.10;
+    bool wasAbove = false;
+    for (int i = 0; i < 80; i++) {
+        if (t > tEnd) break;
+        vec3 p = ro + rd * t;
+        float h = waterH(p.xz);
+        if (p.y > h) {
+            wasAbove = true;
+        } else if (wasAbove) {
+            float tLo = t - stepLen;
+            float tHi = t;
+            for (int j = 0; j < 6; j++) {
+                float tm = 0.5 * (tLo + tHi);
+                vec3 pm = ro + rd * tm;
+                if (pm.y <= waterH(pm.xz)) tHi = tm; else tLo = tm;
+            }
+            vec3 hp = ro + rd * tHi;
+            vec3 wn = waterNormal(hp.xz);
+            if (tHi < best.t) best = Hit(tHi, wn, vec3(0.10, 0.55, 0.62), vec3(0.0), 4, 0.02);
+            return best;
+        }
+        t += stepLen;
+    }
+    return best;
 }
 
 vec3 blendFloorColor(float x, float checker) {
@@ -282,22 +416,22 @@ Hit traceScene(vec3 ro, vec3 rd, bool isPrimary) {
     Hit h;
     float t;
 
+    // пол комнат y=-1.0 (в бассейне - дырa, там настоящая вода)
     if (abs(rd.y) > 0.00001) {
         t = (-1.0 - ro.y) / rd.y;
         if (t > 0.001 && t < best.t) {
             vec3 p = ro + rd * t;
-            if (inMap(p)) {
-                if (inPoolBasin(p)) {
-                    if (waterActive == 1) {
-                        vec3 wn = getWaterNormal(p.xz, timeSec);
-                        best = Hit(t, wn, vec3(0.12, 0.72, 0.82), vec3(0.0), 4, 0.02);
-                    } else {
-                        best = Hit(t, vec3(0.0, 1.0, 0.0), vec3(0.06, 0.28, 0.34), vec3(0.0), 0, 0.1);
-                    }
-                } else {
-                    float checker = mod(floor(p.x * 1.0) + floor(p.z * 1.0), 2.0);
-                    best = Hit(t, vec3(0.0, 1.0, 0.0), blendFloorColor(p.x, checker), vec3(0.0), 0, 0.22);
-                }
+            if (inMap(p) && !inPoolXZ(p.xz)) {
+                float checker = mod(floor(p.x * 1.0) + floor(p.z * 1.0), 2.0);
+                best = Hit(t, vec3(0.0, 1.0, 0.0), blendFloorColor(p.x, checker), vec3(0.0), 0, 0.22);
+            }
+        }
+        // дно бассейна
+        t = (POOL_BOT - ro.y) / rd.y;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (inPoolXZ(p.xz)) {
+                best = Hit(t, vec3(0.0, 1.0, 0.0), poolTileColor(p.xz), vec3(0.0), 0, 0.30);
             }
         }
         t = (3.2 - ro.y) / rd.y;
@@ -425,11 +559,45 @@ Hit traceScene(vec3 ro, vec3 rd, bool isPrimary) {
         }
     }
 
+    // внутренние стенки чаши бассейна (видны над водой и сквозь воду)
+    if (abs(rd.x) > 0.00001) {
+        t = (POOL_MIN.x - ro.x) / rd.x;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (p.y > POOL_BOT && p.y < -1.0 && p.z > POOL_MIN.y && p.z < POOL_MAX.y) {
+                best = Hit(t, vec3(1.0, 0.0, 0.0), basinWallColor(p, 1.0), vec3(0.0), 0, 0.30);
+            }
+        }
+        t = (POOL_MAX.x - ro.x) / rd.x;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (p.y > POOL_BOT && p.y < -1.0 && p.z > POOL_MIN.y && p.z < POOL_MAX.y) {
+                best = Hit(t, vec3(-1.0, 0.0, 0.0), basinWallColor(p, 1.0), vec3(0.0), 0, 0.30);
+            }
+        }
+    }
+    if (abs(rd.z) > 0.00001) {
+        t = (POOL_MIN.y - ro.z) / rd.z;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (p.y > POOL_BOT && p.y < -1.0 && p.x > POOL_MIN.x && p.x < POOL_MAX.x) {
+                best = Hit(t, vec3(0.0, 0.0, 1.0), basinWallColor(p, 0.0), vec3(0.0), 0, 0.30);
+            }
+        }
+        t = (POOL_MAX.y - ro.z) / rd.z;
+        if (t > 0.001 && t < best.t) {
+            vec3 p = ro + rd * t;
+            if (p.y > POOL_BOT && p.y < -1.0 && p.x > POOL_MIN.x && p.x < POOL_MAX.x) {
+                best = Hit(t, vec3(0.0, 0.0, -1.0), basinWallColor(p, 0.0), vec3(0.0), 0, 0.30);
+            }
+        }
+    }
+
     h = intersectSphere(ro, rd, vec3(0.0, 4.6, -1.5), 2.5, vec3(1.0), vec3(6.5, 6.2, 5.8), 3, 1.0); if (h.t < best.t) best = h;
     h = intersectSphere(ro, rd, vec3(15.0, 2.6, -5.2), 0.55, vec3(1.0), vec3(0.2, 4.5, 6.5), 0, 1.0); if (h.t < best.t) best = h;
     h = intersectSphere(ro, rd, vec3(15.0, 2.6,  5.2), 0.55, vec3(1.0), vec3(6.5, 0.4, 5.5), 0, 1.0); if (h.t < best.t) best = h;
     h = intersectSphere(ro, rd, vec3(18.5, 1.8,  0.0), 0.50, vec3(1.0), vec3(6.5, 2.5, 0.3), 0, 1.0); if (h.t < best.t) best = h;
-    h = intersectSphere(ro, rd, vec3(-28.0, 3.05, 0.0), 0.45, vec3(1.0), vec3(0.45, 1.35, 1.65), 0, 1.0); if (h.t < best.t) best = h;
+    h = intersectSphere(ro, rd, POOL_LAMP, 0.45, vec3(1.0), vec3(0.45, 1.35, 1.65), 0, 1.0); if (h.t < best.t) best = h;
 
     h = intersectCylinder(ro, rd, vec2(13.2, -2.2), 0.42, -1.0, 3.2, vec3(0.95, 0.97, 1.0), 1); if (h.t < best.t) best = h;
     h = intersectCylinder(ro, rd, vec2(13.2,  2.5), 0.42, -1.0, 3.2, vec3(0.95, 0.97, 1.0), 1); if (h.t < best.t) best = h;
@@ -439,6 +607,9 @@ Hit traceScene(vec3 ro, vec3 rd, bool isPrimary) {
     h = intersectSphere(ro, rd, s2.xyz, s2.w, vec3(0.2, 0.55, 0.98), vec3(0.0), 0, 0.18); if (h.t < best.t) best = h;
     h = intersectSphere(ro, rd, s3.xyz, s3.w, vec3(1.0, 0.78, 0.25), vec3(0.0), 1, 0.02); if (h.t < best.t) best = h;
     h = intersectSphere(ro, rd, s4.xyz, s4.w, vec3(1.0), vec3(7.5, 6.8, 5.2), 0, 1.0); if (h.t < best.t) best = h;
+
+    // поверхность воды - реальное волновое поле
+    best = marchWater(ro, rd, best);
 
     if (!isPrimary) {
         best = traceCharacter(ro, rd, best);
@@ -546,6 +717,7 @@ vec3 evalReflectedLights(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough) {
     return bounceCol;
 }
 
+// Для теневых лучей вода прозрачна (мат 4 не блокирует свет - луч преломляется)
 vec3 evalPointLight(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough, vec3 lPos, float lRad, vec3 lCol, float intensity, float ambientLeak) {
     vec3 toL = lPos - p;
     float dist = length(toL);
@@ -557,9 +729,22 @@ vec3 evalPointLight(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough, vec3 lPos
     if (ndl <= 0.0) return baseCol * lCol * atten * ambientLeak * fade;
 
     Hit sh = traceScene(p + n * 0.005, lDir, true);
-    float vis = (sh.t >= dist - lRad - 0.08) ? 1.0 : ambientLeak;
+    float vis = (sh.t >= dist - lRad - 0.08 || sh.mat == 4) ? 1.0 : ambientLeak;
     vec3 pbr = shadePBR(p, n, V, baseCol, rough, lDir, lCol * vis * atten * fade);
     return pbr + baseCol * lCol * ambientLeak * atten * fade;
+}
+
+// Свет сквозь воду: фокусировка реальными волнами в точке пересечения луча
+// лампы с поверхностью + поглощение по глубине. Никакой анимации - только
+// реальная геометрия волн из симуляции.
+vec3 underwaterLightMod(vec3 p) {
+    if (p.y >= WLEVEL || !inPoolXZ(p.xz)) return vec3(1.0);
+    vec3 d = p - POOL_LAMP;
+    float tc = (WLEVEL - POOL_LAMP.y) / min(d.y, -0.25);
+    vec2 s = POOL_LAMP.xz + d.xz * tc;
+    float focus = inPoolXZ(s) ? causticFocus(s) : 1.0;
+    float depth = min(WLEVEL - p.y, 1.5);
+    return clamp(vec3(0.35, 0.80, 0.90) * focus, 0.10, 3.0) * exp(-vec3(0.50, 0.15, 0.11) * depth * 1.4);
 }
 
 vec3 computeRoomGI(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough) {
@@ -581,11 +766,32 @@ vec3 computeRoomGI(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough) {
     }
 
     if (p.x < -18.5) {
-        gi += evalPointLight(p, n, V, baseCol, rough, vec3(-28.0, 3.05, 0.0), 0.45, vec3(0.16, 0.48, 0.58), 5.5, 0.18);
-        if (waterActive == 1 && p.y > -0.95) {
-            float poolGlow = clamp(1.0 - length(p.xz - vec2(-28.0, 0.0)) / 9.0, 0.0, 1.0);
-            float c = getWaterCaustic(p.xz + p.y * 0.4, timeSec);
-            gi += baseCol * vec3(0.06, 0.24, 0.30) * poolGlow * (0.4 + c * 0.7);
+        vec3 lampGi = evalPointLight(p, n, V, baseCol, rough, POOL_LAMP, 0.45, vec3(0.16, 0.48, 0.58), 7.5, 0.18);
+        if (p.y < WLEVEL && inPoolXZ(p.xz)) {
+            // подводная точка: свет прошёл сквозь волны
+            gi += lampGi * underwaterLightMod(p);
+            float depth = min(WLEVEL - p.y, 1.5);
+            gi += baseCol * vec3(0.07, 0.16, 0.20) * (1.0 - depth / 2.2);
+        } else {
+            gi += lampGi;
+            if (p.y > WLEVEL) {
+                // бегающие по стенам и потолку отблески от настоящих волн:
+                // зеркальный образ лампы смотрим сквозь рябь в точке отражения
+                vec3 mirLamp = vec3(POOL_LAMP.x, 2.0 * WLEVEL - POOL_LAMP.y, POOL_LAMP.z);
+                vec3 toM = mirLamp - p;
+                float dM = length(toM);
+                vec3 dirM = toM / dM;
+                if (dirM.y < -0.05) {
+                    float tS = (WLEVEL - p.y) / dirM.y;
+                    vec2 sxz = p.xz + dirM.xz * tS;
+                    if (inPoolXZ(sxz)) {
+                        float focus = causticFocus(sxz);
+                        float dSurf = length(vec3(dirM.x * tS, WLEVEL - p.y, dirM.y * tS));
+                        float attenS = 6.0 / max(dSurf * dSurf, 2.0);
+                        gi += baseCol * vec3(0.22, 0.58, 0.66) * attenS * (0.45 + 0.75 * focus);
+                    }
+                }
+            }
         }
     }
 
@@ -597,14 +803,21 @@ vec3 computeRoomGI(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough) {
             float ndotlP = max(dot(n, lDirP), 0.0);
             float attenP = 13.0 / max(distP * distP, 0.45);
             float fadeP = 1.0 - smoothstep(10.0, 16.0, distP);
+            vec3 lamp4 = vec3(0.0);
             if (ndotlP > 0.0) {
                 Hit shP = traceScene(p + n * 0.005, lDirP, true);
-                float visP = (shP.t >= distP - s4.w - 0.06) ? 1.0 : 0.08;
-                gi += shadePBR(p, n, V, baseCol, rough, lDirP, vec3(1.15, 1.02, 0.78) * visP * attenP * fadeP);
-                gi += baseCol * vec3(1.15, 1.02, 0.78) * 0.06 * attenP * fadeP;
+                float visP = (shP.t >= distP - s4.w - 0.06 || shP.mat == 4) ? 1.0 : 0.08;
+                lamp4 += shadePBR(p, n, V, baseCol, rough, lDirP, vec3(1.15, 1.02, 0.78) * visP * attenP * fadeP);
+                lamp4 += baseCol * vec3(1.15, 1.02, 0.78) * 0.06 * attenP * fadeP;
             } else {
-                gi += baseCol * vec3(1.15, 1.02, 0.78) * 0.06 * attenP * fadeP;
+                lamp4 += baseCol * vec3(1.15, 1.02, 0.78) * 0.06 * attenP * fadeP;
             }
+            if (p.y < WLEVEL && inPoolXZ(p.xz)) {
+                float focusS4 = inPoolXZ(s4.xz) ? mix(1.0, causticFocus(s4.xz), 0.6) : 1.0;
+                float depthQ = min(WLEVEL - p.y, 1.5);
+                lamp4 *= focusS4 * exp(-vec3(0.50, 0.15, 0.11) * depthQ * 1.2);
+            }
+            gi += lamp4;
         }
     }
 
@@ -619,10 +832,12 @@ vec3 computeRoomGI(vec3 p, vec3 n, vec3 V, vec3 baseCol, float rough) {
                 float ndotlF = max(dot(n, -dirToSurf), 0.0);
                 if (ndotlF > 0.0) {
                     Hit shF = traceScene(p + n * 0.005, -dirToSurf, true);
-                    if (shF.t >= distF - 0.05) {
+                    if (shF.t >= distF - 0.05 || shF.mat == 4) {
                         float cone = smoothstep(0.84, 0.96, cosAng);
                         float attenF = 24.0 / max(distF * distF, 1.2);
-                        gi += shadePBR(p, n, V, baseCol, rough, -dirToSurf, vec3(1.1, 1.12, 1.18) * cone * attenF);
+                        vec3 fl = shadePBR(p, n, V, baseCol, rough, -dirToSurf, vec3(1.1, 1.12, 1.18) * cone * attenF);
+                        if (p.y < WLEVEL && inPoolXZ(p.xz)) fl *= exp(-W_ABSORB * min(WLEVEL - p.y, 1.5) * 1.2);
+                        gi += fl;
                     }
                 }
             }
@@ -660,50 +875,96 @@ vec3 computeDirectLight(vec3 hitPos, vec3 n, vec3 V, vec3 baseCol, float rough, 
     return vec3(0.0);
 }
 
-vec3 shadePoolWater(vec3 hitPos, vec3 rd, vec3 wn) {
-    float cosTheta = clamp(dot(-rd, wn), 0.0, 1.0);
-    float fresnel = 0.03 + 0.97 * pow(1.0 - cosTheta, 5.0);
+// Поверхность воды сверху: френель, отражение комнаты реальными нормалями
+// волн, преломление в чашу, каустики от лапласиана волн, пена от всплесков.
+vec3 shadeWaterSurface(vec3 p, vec3 rd, vec3 n) {
+    float cosI = clamp(dot(-rd, n), 0.0, 1.0);
+    float F = clamp(0.02 + 0.98 * pow(1.0 - cosI, 5.0), 0.02, 1.0);
 
-    vec3 refrDir = refract(rd, wn, 1.0 / 1.333);
-    if (length(refrDir) < 0.001) refrDir = rd;
-    float depth = 1.35;
-    float tFloor = depth / max(abs(refrDir.y), 0.15);
-    vec3 bottomPos = hitPos + refrDir * tFloor;
+    vec3 refrDir = refract(rd, n, 1.0 / 1.333);
+    if (dot(refrDir, refrDir) < 1e-6) refrDir = normalize(vec3(rd.x, -abs(rd.y) - 0.05, rd.z));
 
-    float tile = mod(floor(bottomPos.x * 2.5) + floor(bottomPos.z * 2.5), 2.0);
-    vec3 tileCol = mix(vec3(0.10, 0.55, 0.65), vec3(0.06, 0.36, 0.45), tile);
-    float caustic = getWaterCaustic(bottomPos.xz, timeSec);
-    vec3 underWater = tileCol * (0.28 + caustic * 0.85);
+    // куда взгляд попадает под водой: дно или стенка чаши
+    float downY = min(refrDir.y, -0.08);
+    float tb = (POOL_BOT - p.y) / downY;
+    float tw = 1e9;
+    bool xWall = false;
+    if (abs(refrDir.x) > 1e-6) {
+        float xw = refrDir.x > 0.0 ? POOL_MAX.x : POOL_MIN.x;
+        float t1 = (xw - p.x) / refrDir.x;
+        vec3 q = p + refrDir * t1;
+        if (q.y > POOL_BOT && q.y < WLEVEL + 0.12 && q.z > POOL_MIN.y && q.z < POOL_MAX.y && t1 < tw) { tw = t1; xWall = true; }
+    }
+    if (abs(refrDir.z) > 1e-6) {
+        float zw = refrDir.z > 0.0 ? POOL_MAX.y : POOL_MIN.y;
+        float t1 = (zw - p.z) / refrDir.z;
+        vec3 q = p + refrDir * t1;
+        if (q.y > POOL_BOT && q.y < WLEVEL + 0.12 && q.x > POOL_MIN.x && q.x < POOL_MAX.x && t1 < tw) { tw = t1; xWall = false; }
+    }
+    float tU = min(tb, tw);
+    vec3 up0 = p + refrDir * tU;
+    bool onWall = tw < tb;
+    vec3 tileCol = onWall ? basinWallColor(up0, xWall ? 1.0 : 0.0) : poolTileColor(up0.xz);
+
+    float focus = causticFocus(p.xz);
+    float depth = max(WLEVEL - up0.y, 0.0);
+
+    // лампа над бассейном: свет сфокусирован реальными волнами
+    vec3 toL = POOL_LAMP - up0;
+    float dL = length(toL);
+    vec3 lampCol = vec3(0.16, 0.50, 0.60) * (7.5 / max(dL * dL, 2.0)) * focus;
+    lampCol *= exp(-vec3(0.50, 0.15, 0.11) * (depth * 1.4 + 0.35));
+
+    vec3 under = tileCol * (vec3(0.10, 0.17, 0.20) + lampCol);
 
     if (s4.w > 0.0) {
-        float dL = length(s4.xyz - hitPos);
-        if (dL < 10.0) underWater += tileCol * vec3(1.15, 1.02, 0.78) * (7.0 / max(dL * dL, 0.6)) * (0.6 + caustic * 0.6);
+        vec3 toP = s4.xyz - up0;
+        float dP = length(toP);
+        if (dP < 12.0) {
+            under += tileCol * vec3(1.15, 1.02, 0.78) * (7.0 / max(dP * dP, 0.8)) * (0.55 + 0.45 * focus)
+                     * exp(-vec3(0.50, 0.15, 0.11) * depth * 1.2);
+        }
     }
     if (flashlight == 1) {
         vec3 spotDir = normalize(camRot * vec3(0.0, 0.0, -1.0));
-        vec3 toW = hitPos - camPos;
+        vec3 toW = up0 - camPos;
         float dF = length(toW);
         float cA = dot(toW / dF, spotDir);
-        if (cA > 0.84 && dF < 16.0) {
-            underWater += tileCol * vec3(1.1) * smoothstep(0.84, 0.96, cA) * (16.0 / max(dF * dF, 1.2));
+        if (cA > 0.80 && dF < 18.0) {
+            under += tileCol * vec3(1.05, 1.08, 1.12) * smoothstep(0.80, 0.93, cA) * (18.0 / max(dF * dF, 1.5))
+                     * (0.55 + 0.45 * focus) * exp(-W_ABSORB * depth * 1.1);
         }
     }
 
-    underWater *= exp(-vec3(0.32, 0.09, 0.06) * tFloor);
+    // пена вокруг свежих всплесков
+    float foam = 0.0;
+    for (int i = 0; i < 4; i++) {
+        if (i >= nFoam) break;
+        vec2 dv = p.xz - foamImp[i].xy;
+        float rr = max(foamImp[i].z, 0.05);
+        foam += foamImp[i].w * exp(-dot(dv, dv) / (rr * rr));
+    }
+    foam = clamp(foam, 0.0, 1.0);
+    under = mix(under, vec3(0.72, 0.82, 0.88) * (0.4 + 0.35 * focus), foam * 0.7);
 
-    vec3 reflDir = reflect(rd, wn);
-    Hit reflHit = traceScene(hitPos + vec3(0.0, 0.01, 0.0), reflDir, false);
-    vec3 reflCol = vec3(0.04, 0.14, 0.18);
-    if (reflHit.t < 1e8) {
-        if (length(reflHit.emit) > 0.1) {
-            reflCol = reflHit.emit;
+    under *= exp(-W_ABSORB * tU);
+
+    // отражение комнаты от гребней волн
+    vec3 reflDir = reflect(rd, n);
+    Hit rh = traceScene(p + n * 0.012, reflDir, false);
+    vec3 reflCol = vec3(0.012, 0.045, 0.06);
+    if (rh.t < 1e8) {
+        if (rh.mat == 4) {
+            reflCol = vec3(0.08, 0.22, 0.26);
+        } else if (length(rh.emit) > 0.1) {
+            reflCol = rh.emit;
         } else {
-            vec3 rp = hitPos + reflDir * reflHit.t;
-            reflCol = computeRoomGI(rp, reflHit.n, -reflDir, reflHit.col, reflHit.rough);
+            vec3 rp = p + reflDir * rh.t;
+            reflCol = computeRoomGI(rp, rh.n, -reflDir, rh.col, rh.rough);
         }
     }
 
-    return mix(underWater, reflCol, clamp(fresnel * 1.15, 0.04, 0.92));
+    return mix(under, reflCol, clamp(F * 1.3, 0.04, 0.96));
 }
 
 void main() {
@@ -719,10 +980,17 @@ void main() {
         vec3 rd = normalize(camRot * vec3(uv, -1.0));
         vec3 throughput = vec3(1.0);
         vec3 radiance = vec3(0.0);
+        int glassPasses = 0;
 
         for (int bounce = 0; bounce < maxBounces; bounce++) {
             Hit h = traceScene(ro, rd, bounce == 0);
             if (h.t > 1e8) break;
+
+            // отрезок пути под водой поглощается по закону Бугера-Ламберта
+            // (сравнение с реальной высотой волны, а не с плоским уровнем)
+            if (inPoolXZ(ro.xz) && ro.y < waterH(ro.xz)) {
+                throughput *= exp(-W_ABSORB * h.t);
+            }
 
             if (h.mat == 3 || length(h.emit) > 0.1) {
                 radiance += throughput * h.emit;
@@ -734,7 +1002,10 @@ void main() {
                 ro = hitPos + h.n * 0.002;
                 rd = reflect(rd, h.n);
                 throughput *= h.col;
+                if (max(max(throughput.r, throughput.g), throughput.b) < 0.02) break;
             } else if (h.mat == 2) {
+                glassPasses++;
+                if (glassPasses > 4) break;
                 float rim = pow(1.0 - abs(dot(rd, h.n)), 4.0);
                 radiance += throughput * vec3(0.45, 0.55, 0.65) * rim * 0.6;
                 vec3 toCenter = normalize(s0.xyz - hitPos);
@@ -744,8 +1015,28 @@ void main() {
                 throughput *= vec3(0.97, 0.99, 1.0);
                 bounce--;
             } else if (h.mat == 4) {
-                radiance += throughput * shadePoolWater(hitPos, rd, h.n);
-                break;
+                if (dot(rd, h.n) < 0.0) {
+                    // входим в воду сверху
+                    radiance += throughput * shadeWaterSurface(hitPos, rd, h.n);
+                    break;
+                } else {
+                    // выходим из воды снизу: полное внутреннее отражение или выход
+                    vec3 N = -h.n;
+                    vec3 refr = refract(rd, N, 1.333);
+                    if (dot(refr, refr) < 1e-4) {
+                        rd = reflect(rd, N);
+                        ro = hitPos + rd * 0.004;
+                    } else {
+                        refr = normalize(refr);
+                        float cosAir = clamp(dot(refr, h.n), 0.0, 1.0);
+                        float Fw = clamp(0.02 + 0.98 * pow(1.0 - cosAir, 5.0), 0.02, 1.0);
+                        radiance += throughput * Fw * vec3(0.03, 0.10, 0.13);
+                        throughput *= (1.0 - Fw);
+                        ro = hitPos + refr * 0.006;
+                        rd = refr;
+                    }
+                    continue;
+                }
             } else {
                 vec2 lightU = vec2(fract(n1 + fs * 0.754877), fract(n2 + fs * 0.569840));
                 vec3 V = -rd;
@@ -759,11 +1050,21 @@ void main() {
     }
 
     vec3 sampleCol = totalRad / float(spp);
+    // дезинфекция выборки: NaN/Inf -> 0, светлячки зажимаем
+    if (any(isnan(sampleCol)) || any(isinf(sampleCol))) sampleCol = vec3(0.0);
+    sampleCol = max(sampleCol, vec3(0.0));
+    float mxS = max(max(sampleCol.r, sampleCol.g), sampleCol.b);
+    if (mxS > 20.0) sampleCol *= 20.0 / mxS;
+
     vec3 prev = texelFetch(prevFrame, ivec2(gl_FragCoord.xy), 0).rgb;
+    if (any(isnan(prev)) || any(isinf(prev))) prev = vec3(0.0);
+    prev = max(prev, vec3(0.0));
+
     vec3 acc = mix(prev, sampleCol, blendWeight);
     fragColor = vec4(acc, 1.0);
 }`;
 
+// ================== ПОСТ-ОБРАБОТКА ==================
 const postFs = `#version 300 es
 precision highp float;
 out vec4 fragColor;
@@ -781,9 +1082,16 @@ vec3 acesToneMap(vec3 x) {
     return pow(mapped, vec3(1.0 / 2.2));
 }
 
+// любая выборка проходит санобработку: NaN не должен расползаться по соседям
+vec3 fetchS(ivec2 pp) {
+    vec3 c = texelFetch(tex, pp, 0).rgb;
+    if (any(isnan(c)) || any(isinf(c))) return vec3(0.0);
+    return max(c, vec3(0.0));
+}
+
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    vec3 center = texelFetch(tex, p, 0).rgb;
+    vec3 center = fetchS(p);
 
     vec2 centerDist = abs(gl_FragCoord.xy - res * 0.5);
     if (centerDist.x < 1.8 && centerDist.y < 1.8) {
@@ -798,7 +1106,7 @@ void main() {
         float wSum = 0.0;
         for (int x = -1; x <= 1; x++) {
             for (int y = -1; y <= 1; y++) {
-                vec3 c = texelFetch(tex, p + ivec2(x, y), 0).rgb;
+                vec3 c = fetchS(p + ivec2(x, y));
                 float diff = length(c - center) / (1.0 + length(center));
                 float w = exp(-float(x*x + y*y) * 0.5) * exp(-diff * 8.0);
                 sum += c * w;
@@ -808,14 +1116,15 @@ void main() {
         finalCol = sum / max(wSum, 0.0001);
     }
 
-    vec3 n = texelFetch(tex, p + ivec2(0,  1), 0).rgb;
-    vec3 s = texelFetch(tex, p + ivec2(0, -1), 0).rgb;
-    vec3 e = texelFetch(tex, p + ivec2( 1, 0), 0).rgb;
-    vec3 w = texelFetch(tex, p + ivec2(-1, 0), 0).rgb;
+    vec3 n = fetchS(p + ivec2(0,  1));
+    vec3 s = fetchS(p + ivec2(0, -1));
+    vec3 e = fetchS(p + ivec2( 1, 0));
+    vec3 w = fetchS(p + ivec2(-1, 0));
     vec3 blur = (n + s + e + w) * 0.25;
     vec3 sharpCol = finalCol + (finalCol - blur) * 0.42;
+    sharpCol = clamp(sharpCol, vec3(0.0), vec3(60.0));
 
-    fragColor = vec4(acesToneMap(max(sharpCol, vec3(0.0))), 1.0);
+    fragColor = vec4(acesToneMap(sharpCol), 1.0);
 }`;
 
 function compile(type, src) {
@@ -837,9 +1146,20 @@ function link(v, f) {
 
 const prog = link(vs, fs);
 const postProg = link(vs, postFs);
+const simProg = link(vs, simFs);
 const buf = gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER, buf);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(new Array(-1.0,-1.0, 1.0,-1.0, -1.0,1.0, 1.0,1.0)), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+// юниты сэмплеров
+gl.useProgram(prog);
+gl.uniform1i(gl.getUniformLocation(prog, 'prevFrame'), 0);
+gl.uniform1i(gl.getUniformLocation(prog, 'waterTex'), 1);
+gl.useProgram(simProg);
+gl.uniform1i(gl.getUniformLocation(simProg, 'curTex'), 0);
+gl.uniform1i(gl.getUniformLocation(simProg, 'prevTex'), 1);
 
 gl.getExtension('EXT_color_buffer_float');
 function makeTex() {
@@ -848,6 +1168,16 @@ function makeTex() {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, canvas.width, canvas.height, 0, gl.RGBA, gl.FLOAT, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+}
+function makeTex16(w, h) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     return t;
@@ -872,6 +1202,37 @@ if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
 gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 let frame = 0, totalSamples = 0;
 
+// ---- геометрия бассейна (общая для JS-физики и шейдеров) ----
+const POOL = { minX: -32.0, maxX: -24.0, minZ: -5.5, maxZ: 5.5, level: -1.06, bot: -2.5 };
+const EYE_H = 0.95;
+
+// ---- сетка симуляции воды: 160 x 220, ячейка 5 см, шаг 72 Гц ----
+const SIM_W = 160, SIM_H = 220, SIM_DT = 1.0 / 72.0;
+let simCur = 0, simTick = 0, simAcc = 0.0;
+const simTex = [makeTex16(SIM_W, SIM_H), makeTex16(SIM_W, SIM_H), makeTex16(SIM_W, SIM_H)];
+gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+gl.viewport(0, 0, SIM_W, SIM_H);
+for (let i = 0; i < 3; i++) {
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, simTex[i], 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+}
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+// ---- события на воде: всплески (импульсы в сим) и пена (для шейдера) ----
+const impacts = [];   // {x, z, r, s, t} - свежие импульсы, живут 100 мс
+const foam = [];      // {x, z, r, f, t} - белые пятна, живут ~1.5 с
+function addImpact(x, z, radius, str, primary) {
+    const mx = Math.max(POOL.minX + 0.25, Math.min(POOL.maxX - 0.25, x));
+    const mz = Math.max(POOL.minZ + 0.25, Math.min(POOL.maxZ - 0.25, z));
+    const nowMs = performance.now();
+    impacts.push({ x: mx, z: mz, r: radius, s: str, t: nowMs });
+    if (impacts.length > 28) impacts.shift();
+    if (primary) {
+        foam.push({ x: mx, z: mz, r: radius * 1.6, f: Math.min(1.0, str * 7.0), t: nowMs });
+        if (foam.length > 10) foam.shift();
+    }
+}
+
 let camX = 0.0, camY = -0.05, camZ = 1.5;
 let velY = 0.0;
 let onGround = true;
@@ -879,28 +1240,33 @@ let yaw = 0.0, pitch = -0.04;
 let targetYaw = 0.0, targetPitch = -0.04;
 let walkPhase = 0.0;
 let flashlightOn = false;
+let wasInWater = false;
+let wakeStrength = 0.0;
+let waveEnergy = 0.0;
 const keys = new Map();
 
+// шар: цвет материала зашит в шейдер, density - плавучесть (тонет, если > 1)
 const balls = new Array(
-    { x:  0.0, y: -0.52, z: -4.2, r: 0.48, vx: 0, vy: 0, vz: 0 },
-    { x: -1.6, y: -0.48, z: -4.8, r: 0.52, vx: 0, vy: 0, vz: 0 },
-    { x:  1.6, y: -0.55, z: -4.5, r: 0.45, vx: 0, vy: 0, vz: 0 },
-    { x: -0.6, y: -0.64, z: -2.8, r: 0.36, vx: 0, vy: 0, vz: 0 },
-    { x: -3.2, y: -0.68, z: -4.8, r: 0.32, vx: 0, vy: 0, vz: 0 }
+    { x:  0.0, y: -0.52, z: -4.2, r: 0.48, vx: 0, vy: 0, vz: 0, density: 0.90, inWater: false, wakeCd: 0 },
+    { x: -1.6, y: -0.48, z: -4.8, r: 0.52, vx: 0, vy: 0, vz: 0, density: 2.60, inWater: false, wakeCd: 0 },
+    { x:  1.6, y: -0.55, z: -4.5, r: 0.45, vx: 0, vy: 0, vz: 0, density: 0.30, inWater: false, wakeCd: 0 },
+    { x: -0.6, y: -0.64, z: -2.8, r: 0.36, vx: 0, vy: 0, vz: 0, density: 4.50, inWater: false, wakeCd: 0 },
+    { x: -3.2, y: -0.68, z: -4.8, r: 0.32, vx: 0, vy: 0, vz: 0, density: 0.22, inWater: false, wakeCd: 0 }
 );
 let grabbedBall = null;
 
 function resetBalls() {
-    const b0 = balls.at(0); b0.x = 0.0;  b0.y = -0.52; b0.z = -4.2; b0.vx = b0.vy = b0.vz = 0;
-    const b1 = balls.at(1); b1.x = -1.6; b1.y = -0.48; b1.z = -4.8; b1.vx = b1.vy = b1.vz = 0;
-    const b2 = balls.at(2); b2.x = 1.6;  b2.y = -0.55; b2.z = -4.5; b2.vx = b2.vy = b2.vz = 0;
-    const b3 = balls.at(3); b3.x = -0.6; b3.y = -0.64; b3.z = -2.8; b3.vx = b3.vy = b3.vz = 0;
-    const b4 = balls.at(4); b4.x = -3.2; b4.y = -0.68; b4.z = -4.8; b4.vx = b4.vy = b4.vz = 0;
+    const b0 = balls.at(0); b0.x = 0.0;  b0.y = -0.52; b0.z = -4.2; b0.vx = b0.vy = b0.vz = 0; b0.inWater = false;
+    const b1 = balls.at(1); b1.x = -1.6; b1.y = -0.48; b1.z = -4.8; b1.vx = b1.vy = b1.vz = 0; b1.inWater = false;
+    const b2 = balls.at(2); b2.x = 1.6;  b2.y = -0.55; b2.z = -4.5; b2.vx = b2.vy = b2.vz = 0; b2.inWater = false;
+    const b3 = balls.at(3); b3.x = -0.6; b3.y = -0.64; b3.z = -2.8; b3.vx = b3.vy = b3.vz = 0; b3.inWater = false;
+    const b4 = balls.at(4); b4.x = -3.2; b4.y = -0.68; b4.z = -4.8; b4.vx = b4.vy = b4.vz = 0; b4.inWater = false;
     grabbedBall = null;
     frame = 0;
 }
 
-function isWaterVisible() {
+function poolVisible() {
+    if (camX > POOL.minX - 0.5 && camX < POOL.maxX + 0.5 && Math.abs(camZ) < POOL.maxZ + 0.5) return true;
     if (camX > -9.2) return false;
     if (camX < -21.2) return true;
 
@@ -1060,6 +1426,43 @@ function getCamMatrix() {
     ));
 }
 
+// шаг симуляции воды (72 Гц): тройной пинг-понг 16F текстур
+const impArr = new Float32Array(32);
+const foamArr = new Float32Array(16);
+function stepSim(nowMs) {
+    const iCur = simCur, iPrev = (simCur + 1) % 3, iNext = (simCur + 2) % 3;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, simTex[iNext], 0);
+    gl.viewport(0, 0, SIM_W, SIM_H);
+    gl.useProgram(simProg);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, simTex[iCur]);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, simTex[iPrev]);
+
+    let nImp = 0;
+    for (let k = impacts.length - 1; k >= 0 && nImp < 8; k--) {
+        const im = impacts.at(k);
+        const age = (nowMs - im.t) / 1000.0;
+        if (age >= 0.1) continue;
+        const eff = im.s * (1.0 - age / 0.1);
+        impArr[nImp * 4] = im.x;
+        impArr[nImp * 4 + 1] = im.z;
+        impArr[nImp * 4 + 2] = im.r;
+        impArr[nImp * 4 + 3] = -eff;
+        nImp++;
+    }
+    gl.uniform2f(gl.getUniformLocation(simProg, 'simRes'), SIM_W, SIM_H);
+    gl.uniform2f(gl.getUniformLocation(simProg, 'poolOrigin'), -32.0, -5.5);
+    gl.uniform2f(gl.getUniformLocation(simProg, 'poolSize'), 8.0, 11.0);
+    gl.uniform1f(gl.getUniformLocation(simProg, 'damp'), Math.exp(-0.25 * SIM_DT));
+    gl.uniform1f(gl.getUniformLocation(simProg, 'tick'), simTick++);
+    gl.uniform1i(gl.getUniformLocation(simProg, 'nImp'), nImp);
+    gl.uniform4fv(gl.getUniformLocation(simProg, 'imp[0]'), impArr);
+    gl.uniform4f(gl.getUniformLocation(simProg, 'wake'), camX, camZ, wakeStrength, 0.0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    simCur = iNext;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
 let startTime = performance.now();
 let lastFrameTime = performance.now();
 let lastFpsUpdate = performance.now(), framesCount = 0, currentFps = 0;
@@ -1089,37 +1492,99 @@ function render(now) {
         pitch = targetPitch;
     }
 
-    const speed = 4.6 * dt;
-    const fwdX = -Math.sin(yaw), fwdZ = -Math.cos(yaw);
-    const rightX = Math.cos(yaw), rightZ = -Math.sin(yaw);
-    let isWalking = false;
+    // ============ ИГРОК: ходьба / плавание ============
+    const overBasin = camX > POOL.minX && camX < POOL.maxX && camZ > POOL.minZ && camZ < POOL.maxZ;
+    const inWaterNow = overBasin && camY < POOL.level + 0.9;
+    if (onGround && overBasin) { onGround = false; velY = Math.min(velY, 0.0); }
 
-    if (keys.get('KeyW')) { camX += fwdX * speed; camZ += fwdZ * speed; needResetFrame = true; isWalking = true; }
-    if (keys.get('KeyS')) { camX -= fwdX * speed; camZ -= fwdZ * speed; needResetFrame = true; isWalking = true; }
-    if (keys.get('KeyD')) { camX += rightX * speed; camZ += rightZ * speed; needResetFrame = true; isWalking = true; }
-    if (keys.get('KeyA')) { camX -= rightX * speed; camZ -= rightZ * speed; needResetFrame = true; isWalking = true; }
+    if (inWaterNow) {
+        // вода и так анимируется каждый кадр - аккумуляция в режиме EMA,
+        // сбрасывать накопление не нужно
+        // выталкивающая сила: равновесие - глаза чуть над водой
+        const floatY = POOL.level + 0.86;
+        const sub = Math.max(0.0, Math.min(1.0, (floatY - camY) / 0.85));
+        velY += (24.0 * sub - 11.5) * dt;
+        velY *= Math.exp(-3.4 * dt);
 
-    if (isWalking && onGround) {
-        walkPhase += dt * 11.0;
-    } else {
-        walkPhase *= 0.85;
-    }
+        const cy = Math.cos(yaw), sy = Math.sin(yaw);
+        const cp = Math.cos(pitch), sp = Math.sin(pitch);
+        const lookX = -sy * cp, lookY = sp, lookZ = -cy * cp;
+        const swim = 2.7 * dt;
+        let movingNow = false;
+        if (keys.get('KeyW')) { camX += lookX * swim; camY += lookY * swim; camZ += lookZ * swim; movingNow = true; }
+        if (keys.get('KeyS')) { camX -= lookX * swim; camY -= lookY * swim; camZ -= lookZ * swim; movingNow = true; }
+        if (keys.get('KeyD')) { camX += Math.cos(yaw) * swim; camZ -= Math.sin(yaw) * swim; movingNow = true; }
+        if (keys.get('KeyA')) { camX -= Math.cos(yaw) * swim; camZ += Math.sin(yaw) * swim; movingNow = true; }
+        if (keys.get('Space')) velY = Math.min(velY + 9.0 * dt, 3.4);
+        if (keys.get('KeyC')) velY = Math.max(velY - 9.0 * dt, -3.0);
 
-    if (!onGround) {
-        velY -= 11.5 * dt;
         camY += velY * dt;
-        if (camY <= -0.05) {
-            camY = -0.05;
-            velY = 0.0;
-            onGround = true;
+
+        // дно бассейна
+        if (camY < POOL.bot + EYE_H) { camY = POOL.bot + EYE_H; if (velY < 0) velY = 0; onGround = true; }
+        else onGround = false;
+        // у поверхности выше не выпрыгнуть (кроме вылезания у бортика)
+        if (camY > POOL.level + 0.87 && velY < 3.0) { camY = POOL.level + 0.87; velY *= 0.25; }
+
+        // стенки чаши
+        const m = 0.34;
+        let atWall = false;
+        if (camX < POOL.minX + m) { camX = POOL.minX + m; atWall = true; }
+        if (camX > POOL.maxX - m) { camX = POOL.maxX - m; atWall = true; }
+        if (camZ < POOL.minZ + m) { camZ = POOL.minZ + m; atWall = true; }
+        if (camZ > POOL.maxZ - m) { camZ = POOL.maxZ - m; atWall = true; }
+        if (atWall && (keys.get('KeyW') || keys.get('KeyA') || keys.get('KeyS') || keys.get('KeyD')) && camY > POOL.level + 0.28) {
+            velY = Math.max(velY, 3.9); // выпрыгиваем на бортик
         }
-        needResetFrame = true;
+
+        // всплеск при входе в воду
+        if (!wasInWater) {
+            const str = Math.min(0.24, 0.06 + Math.abs(velY) * 0.05);
+            addImpact(camX, camZ, 0.95, str, true);
+            waveEnergy += str;
+        }
+        wakeStrength = (movingNow || Math.abs(velY) > 0.45) ? -(0.0016 + Math.abs(velY) * 0.0009) : 0.0;
+    } else {
+        wakeStrength = 0.0;
+        if (wasInWater && overBasin) {
+            addImpact(camX, camZ, 0.7, 0.06, true);
+            waveEnergy += 0.06;
+        }
+        const speed = 4.6 * dt;
+        const fwdX = -Math.sin(yaw), fwdZ = -Math.cos(yaw);
+        const rightX = Math.cos(yaw), rightZ = -Math.sin(yaw);
+        let isWalking = false;
+
+        if (keys.get('KeyW')) { camX += fwdX * speed; camZ += fwdZ * speed; needResetFrame = true; isWalking = true; }
+        if (keys.get('KeyS')) { camX -= fwdX * speed; camZ -= fwdZ * speed; needResetFrame = true; isWalking = true; }
+        if (keys.get('KeyD')) { camX += rightX * speed; camZ += rightZ * speed; needResetFrame = true; isWalking = true; }
+        if (keys.get('KeyA')) { camX -= rightX * speed; camZ -= rightZ * speed; needResetFrame = true; isWalking = true; }
+
+        if (isWalking && onGround) {
+            walkPhase += dt * 11.0;
+        } else {
+            walkPhase *= 0.85;
+        }
+
+        if (!onGround) {
+            velY -= 11.5 * dt;
+            camY += velY * dt;
+            if (camY <= -0.05 && !overBasin) {
+                camY = -0.05;
+                velY = 0.0;
+                onGround = true;
+            }
+            needResetFrame = true;
+        }
     }
+    wasInWater = inWaterNow;
+    waveEnergy *= Math.exp(-dt * 1.2);
 
     const pObj = { x: camX, z: camZ, vx: 0, vz: 0 };
     resolveRoomBounds(pObj, 0.38, true);
     camX = pObj.x; camZ = pObj.z;
 
+    // ============ ШАРЫ: гравитация, вода, всплески ============
     for (let i = 0; i < balls.length; i++) {
         const b = balls.at(i);
 
@@ -1127,12 +1592,61 @@ function render(now) {
             const cy = Math.cos(yaw), sy = Math.sin(yaw);
             const cp = Math.cos(pitch), sp = Math.sin(pitch);
             b.x = camX - sy * cp * 1.45;
-            b.y = Math.max(-1.0 + b.r, Math.min(2.2 - b.r, camY + sp * 1.45));
+            b.y = Math.max(POOL.bot + b.r, Math.min(2.2 - b.r, camY + sp * 1.45));
             b.z = camZ - cy * cp * 1.45;
             b.vx = b.vy = b.vz = 0;
             resolveRoomBounds(b, b.r, false);
             needResetFrame = true;
+            continue;
+        }
+
+        const overBasinB = b.x > POOL.minX && b.x < POOL.maxX && b.z > POOL.minZ && b.z < POOL.maxZ;
+
+        if (overBasinB) {
+            const s = Math.max(0.0, Math.min(1.0, (POOL.level - (b.y - b.r)) / (2.0 * b.r)));
+            if (s > 0.02) {
+                if (!b.inWater) {
+                    const sp = Math.abs(b.vy);
+                    const str = Math.min(0.30, 0.025 + sp * 0.05 * (b.r * 2.0));
+                    addImpact(b.x, b.z, Math.max(0.32, b.r * 1.5), str, true);
+                    waveEnergy += str;
+                    b.inWater = true;
+                }
+                // архимед: тонет, если плотность больше воды (1.0)
+                b.vy += ((s / b.density) - 1.0) * 9.8 * dt;
+                const drg = Math.exp(-dt * (0.8 + 4.0 * s));
+                b.vx *= drg; b.vz *= drg;
+                b.vy *= Math.exp(-dt * (0.4 + 3.2 * s));
+                if (s < 1.0) b.vy += Math.sin(timeSec * 2.6 + i * 2.1) * 0.4 * dt;
+                b.wakeCd -= dt;
+                if (Math.hypot(b.vx, b.vz) > 0.35 && b.wakeCd <= 0) {
+                    addImpact(b.x, b.z, b.r * 1.3, 0.010, false);
+                    b.wakeCd = 0.3;
+                }
+            } else {
+                if (b.inWater && b.vy > 1.2) {
+                    addImpact(b.x, b.z, b.r * 1.4, 0.05, true);
+                    waveEnergy += 0.05;
+                }
+                b.inWater = false;
+                b.vy -= 9.8 * dt;
+            }
+            b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+
+            // дно чаши
+            if (b.y - b.r <= POOL.bot) {
+                b.y = POOL.bot + b.r;
+                b.vy = Math.abs(b.vy) > 0.4 ? Math.abs(b.vy) * 0.35 : 0.0;
+            }
+            // стенки чаши под водой
+            if (b.y - b.r < POOL.level + 0.1) {
+                if (b.x < POOL.minX + b.r) { b.x = POOL.minX + b.r; b.vx = Math.abs(b.vx) * 0.6; }
+                if (b.x > POOL.maxX - b.r) { b.x = POOL.maxX - b.r; b.vx = -Math.abs(b.vx) * 0.6; }
+                if (b.z < POOL.minZ + b.r) { b.z = POOL.minZ + b.r; b.vz = Math.abs(b.vz) * 0.6; }
+                if (b.z > POOL.maxZ - b.r) { b.z = POOL.maxZ - b.r; b.vz = -Math.abs(b.vz) * 0.6; }
+            }
         } else {
+            b.inWater = false;
             if (Math.abs(b.vx) < 0.025 && Math.abs(b.vz) < 0.025 && Math.abs(b.vy) < 0.05 && b.y <= -1.0 + b.r + 0.005) {
                 b.vx = b.vy = b.vz = 0;
                 b.y = -1.0 + b.r;
@@ -1152,25 +1666,26 @@ function render(now) {
                     b.vy = Math.abs(b.vy) > 0.35 ? Math.abs(b.vy) * 0.5 : 0;
                 }
                 if (b.y + b.r > maxCeiling) { b.y = maxCeiling - b.r; b.vy = -Math.abs(b.vy) * 0.5; }
-                resolveRoomBounds(b, b.r, false);
                 needResetFrame = true;
             }
+        }
+        resolveRoomBounds(b, b.r, false);
 
-            const dx = b.x - camX, dz = b.z - camZ;
-            const dist = Math.hypot(dx, dz);
-            const minDist = b.r + 0.38;
-            if (dist < minDist && dist > 0.001 && camY - 0.90 < b.y + b.r && camY + 0.25 > b.y - b.r) {
-                const overlap = minDist - dist;
-                const nx = dx / dist, nz = dz / dist;
-                b.x += nx * overlap * 0.75;
-                b.z += nz * overlap * 0.75;
-                camX -= nx * overlap * 0.25;
-                camZ -= nz * overlap * 0.25;
-                b.vx += nx * 3.2;
-                b.vz += nz * 3.2;
-                resolveRoomBounds(b, b.r, false);
-                needResetFrame = true;
-            }
+        // отталкивание от игрока
+        const dx = b.x - camX, dz = b.z - camZ;
+        const dist = Math.hypot(dx, dz);
+        const minDist = b.r + 0.38;
+        if (dist < minDist && dist > 0.001 && camY - 0.90 < b.y + b.r && camY + 0.25 > b.y - b.r) {
+            const overlap = minDist - dist;
+            const nx = dx / dist, nz = dz / dist;
+            b.x += nx * overlap * 0.75;
+            b.z += nz * overlap * 0.75;
+            camX -= nx * overlap * 0.25;
+            camZ -= nz * overlap * 0.25;
+            b.vx += nx * 3.2;
+            b.vz += nz * 3.2;
+            resolveRoomBounds(b, b.r, false);
+            needResetFrame = true;
         }
     }
 
@@ -1184,58 +1699,98 @@ function render(now) {
                 if (d < minD - 0.001 && d > 0.0001) {
                     const ov = (minD - d) * 0.5;
                     const nx = dx / d, ny = dy / d, nz = dz / d;
-if (a !== grabbedBall) { a.x -= nx * ov; a.y -= ny * ov; a.z -= nz * ov; a.vx -= nx * 1.4; a.vz -= nz * 1.4; resolveRoomBounds(a, a.r, false); }
-if (b !== grabbedBall) { b.x += nx * ov; b.y += ny * ov; b.z += nz * ov; b.vx += nx * 1.4; b.vz += nz * 1.4; resolveRoomBounds(b, b.r, false); }
-needResetFrame = true;
-}
-}
-}
-}
-const waterVis = isWaterVisible();
-if (needResetFrame) frame = 0;
-if (frame === 0) totalSamples = 0;
-let blendWeight = waterVis ? 0.35 : ((frame === 0) ? 0.65 : (1.0 / (frame + 1.0)));
-let currentSpp = (frame < 3) ? 4 : 8;
-gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texB, 0);
-gl.viewport(0, 0, canvas.width, canvas.height);
-gl.useProgram(prog);
-gl.enableVertexAttribArray(0);
-gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-gl.uniform2f(gl.getUniformLocation(prog, 'res'), canvas.width, canvas.height);
-gl.uniform1f(gl.getUniformLocation(prog, 'frame'), frame);
-gl.uniform1f(gl.getUniformLocation(prog, 'timeSec'), timeSec);
-gl.uniform1f(gl.getUniformLocation(prog, 'blendWeight'), blendWeight);
-gl.uniform1f(gl.getUniformLocation(prog, 'walkPhase'), walkPhase);
-gl.uniform1i(gl.getUniformLocation(prog, 'spp'), currentSpp);
-gl.uniform1i(gl.getUniformLocation(prog, 'maxBounces'), 6);
-gl.uniform1i(gl.getUniformLocation(prog, 'flashlight'), flashlightOn ? 1 : 0);
-gl.uniform1i(gl.getUniformLocation(prog, 'waterActive'), waterVis ? 1 : 0);
-gl.uniform3f(gl.getUniformLocation(prog, 'camPos'), camX, camY, camZ);
-gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'camRot'), false, getCamMatrix());
-const b0 = balls.at(0), b1 = balls.at(1), b2 = balls.at(2), b3 = balls.at(3), b4 = balls.at(4);
-gl.uniform4f(gl.getUniformLocation(prog, 's0'), b0.x, b0.y, b0.z, b0.r);
-gl.uniform4f(gl.getUniformLocation(prog, 's1'), b1.x, b1.y, b1.z, b1.r);
-gl.uniform4f(gl.getUniformLocation(prog, 's2'), b2.x, b2.y, b2.z, b2.r);
-gl.uniform4f(gl.getUniformLocation(prog, 's3'), b3.x, b3.y, b3.z, b3.r);
-gl.uniform4f(gl.getUniformLocation(prog, 's4'), b4.x, b4.y, b4.z, b4.r);
-gl.activeTexture(gl.TEXTURE0);
-gl.bindTexture(gl.TEXTURE_2D, texA);
-gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-gl.viewport(0, 0, canvas.width, canvas.height);
-gl.useProgram(postProg);
-gl.bindTexture(gl.TEXTURE_2D, texB);
-gl.uniform2f(gl.getUniformLocation(postProg, 'res'), canvas.width, canvas.height);
-gl.uniform1f(gl.getUniformLocation(postProg, 'frame'), frame);
-gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-const tmp = texA; texA = texB; texB = tmp;
-frame++;
-totalSamples += currentSpp;
-fpsEl.textContent = `FPS: ${currentFps} | Сэмплов: ${totalSamples}`;
-waterEl.textContent = waterVis ? 'Вода: АКТИВНА' : 'Вода: СКРЫТА';
-if (frame > 2 && loadOverlay.style.display !== 'none') loadOverlay.style.display = 'none';
-requestAnimationFrame(render);
+                    if (a !== grabbedBall) { a.x -= nx * ov; a.y -= ny * ov; a.z -= nz * ov; a.vx -= nx * 1.4; a.vz -= nz * 1.4; resolveRoomBounds(a, a.r, false); }
+                    if (b !== grabbedBall) { b.x += nx * ov; b.y += ny * ov; b.z += nz * ov; b.vx += nx * 1.4; b.vz += nz * 1.4; resolveRoomBounds(b, b.r, false); }
+                    needResetFrame = true;
+                }
+            }
+        }
+    }
+
+    // ============ СИМУЛЯЦИЯ ВОДЫ (фиксированный шаг 72 Гц) ============
+    simAcc += dt;
+    let simSteps = 0;
+    while (simAcc >= SIM_DT && simSteps < 3) {
+        stepSim(now);
+        simAcc -= SIM_DT;
+        simSteps++;
+    }
+    if (simAcc > SIM_DT) simAcc = 0;
+    while (impacts.length && (now - impacts.at(0).t) > 120) impacts.shift();
+    while (foam.length && (now - foam.at(0).t) > 1600) foam.shift();
+
+    const poolVis = poolVisible();
+    const camUnder = overBasin && camY < POOL.level + 0.12;
+    if (needResetFrame) frame = 0;
+    if (frame === 0) totalSamples = 0;
+    let blendWeight = camUnder ? 0.34 : (poolVis ? 0.30 : (frame === 0 ? 0.62 : 1.0 / (frame + 1.0)));
+    let currentSpp = (frame < 3) ? 4 : (poolVis ? 6 : 8);
+
+    // ============ ТРАССИРОВКА ============
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texB, 0);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(prog);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.uniform2f(gl.getUniformLocation(prog, 'res'), canvas.width, canvas.height);
+    gl.uniform1f(gl.getUniformLocation(prog, 'frame'), frame);
+    gl.uniform1f(gl.getUniformLocation(prog, 'timeSec'), timeSec);
+    gl.uniform1f(gl.getUniformLocation(prog, 'blendWeight'), blendWeight);
+    gl.uniform1f(gl.getUniformLocation(prog, 'walkPhase'), walkPhase);
+    gl.uniform1i(gl.getUniformLocation(prog, 'spp'), currentSpp);
+    gl.uniform1i(gl.getUniformLocation(prog, 'maxBounces'), 6);
+    gl.uniform1i(gl.getUniformLocation(prog, 'flashlight'), flashlightOn ? 1 : 0);
+    gl.uniform3f(gl.getUniformLocation(prog, 'camPos'), camX, camY, camZ);
+    gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'camRot'), false, getCamMatrix());
+    const b0 = balls.at(0), b1 = balls.at(1), b2 = balls.at(2), b3 = balls.at(3), b4 = balls.at(4);
+    gl.uniform4f(gl.getUniformLocation(prog, 's0'), b0.x, b0.y, b0.z, b0.r);
+    gl.uniform4f(gl.getUniformLocation(prog, 's1'), b1.x, b1.y, b1.z, b1.r);
+    gl.uniform4f(gl.getUniformLocation(prog, 's2'), b2.x, b2.y, b2.z, b2.r);
+    gl.uniform4f(gl.getUniformLocation(prog, 's3'), b3.x, b3.y, b3.z, b3.r);
+    gl.uniform4f(gl.getUniformLocation(prog, 's4'), b4.x, b4.y, b4.z, b4.r);
+
+    let nFoamU = 0;
+    for (let k = foam.length - 1; k >= 0 && nFoamU < 4; k--) {
+        const f = foam.at(k);
+        const age = (now - f.t) / 1000.0;
+        const eff = f.f * Math.exp(-age * 3.0);
+        foamArr[nFoamU * 4] = f.x;
+        foamArr[nFoamU * 4 + 1] = f.z;
+        foamArr[nFoamU * 4 + 2] = f.r;
+        foamArr[nFoamU * 4 + 3] = eff;
+        nFoamU++;
+    }
+    gl.uniform1i(gl.getUniformLocation(prog, 'nFoam'), nFoamU);
+    gl.uniform4fv(gl.getUniformLocation(prog, 'foamImp[0]'), foamArr);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texA);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, simTex[simCur]);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // ============ ПОСТ-ОБРАБОТКА ============
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(postProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texB);
+    gl.uniform2f(gl.getUniformLocation(postProg, 'res'), canvas.width, canvas.height);
+    gl.uniform1f(gl.getUniformLocation(postProg, 'frame'), poolVis ? 0.0 : frame);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    const tmp = texA; texA = texB; texB = tmp;
+    frame++;
+    totalSamples += currentSpp;
+    fpsEl.textContent = `FPS: ${currentFps} | Сэмплов: ${totalSamples}`;
+    if (camUnder) {
+        waterEl.textContent = 'Вода: ТЫ ПОД ВОДОЙ';
+    } else {
+        const st = waveEnergy > 0.09 ? 'ВОЛНЫ' : (waveEnergy > 0.012 ? 'РЯБЬ' : 'ШТИЛЬ');
+        waterEl.textContent = 'Вода: ' + st;
+    }
+    if (frame > 2 && loadOverlay.style.display !== 'none') loadOverlay.style.display = 'none';
+    requestAnimationFrame(render);
 }
 
 const extParallel = gl.getExtension('KHR_parallel_shader_compile');
@@ -1256,18 +1811,20 @@ function bootGame() {
         bootTries++;
         const readyA = gl.getProgramParameter(prog, asyncQuery);
         const readyB = gl.getProgramParameter(postProg, asyncQuery);
+        const readyC = gl.getProgramParameter(simProg, asyncQuery);
         const okA = (readyA === true || readyA === false);
         const okB = (readyB === true || readyB === false);
-        if (!okA || !okB) {
+        const okC = (readyC === true || readyC === false);
+        if (!okA || !okB || !okC) {
             asyncQuery = null;
-        } else if (!(readyA && readyB)) {
+        } else if (!(readyA && readyB && readyC)) {
             setTimeout(bootGame, 60);
             return;
         }
     }
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS) || !gl.getProgramParameter(postProg, gl.LINK_STATUS)) {
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS) || !gl.getProgramParameter(postProg, gl.LINK_STATUS) || !gl.getProgramParameter(simProg, gl.LINK_STATUS)) {
         gpuEl.style.color = '#ff4444';
-        gpuEl.textContent = 'ОШИБКА ЛИНКОВКИ: ' + gl.getProgramInfoLog(prog) + ' || ' + gl.getProgramInfoLog(postProg);
+        gpuEl.textContent = 'ОШИБКА ЛИНКОВКИ: ' + gl.getProgramInfoLog(prog) + ' || ' + gl.getProgramInfoLog(postProg) + ' || ' + gl.getProgramInfoLog(simProg);
         loadOverlay.textContent = 'Ошибка линковки шейдеров - подробности в строке GPU';
         return;
     }
